@@ -9,9 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
 import torch
 from scene import Scene, DeformModel
-import os
 from tqdm import tqdm
 from os import makedirs
 from gaussian_renderer import render
@@ -26,31 +27,45 @@ import numpy as np
 
 
 def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, deform):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "blend") # name: train or test
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
+
+    static_path = os.path.join(model_path, name, "ours_{}".format(iteration), "static")
+    dynamic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "dynamic")
+    dynamic_mask_path = os.path.join(model_path, name, "ours_{}".format(iteration), "mask")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+    makedirs(static_path, exist_ok=True)
+    makedirs(dynamic_path, exist_ok=True)
+    makedirs(dynamic_mask_path, exist_ok=True)
+
+    for idx, view in enumerate(tqdm(views, desc="Rendering progress")): # views: TrainCameras or TestCameras
         if load2gpu_on_the_fly:
             view.load2device()
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-        d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+        d_xyz, d_rotation, d_scaling, _ = deform.step(xyz.detach(), time_input)
+
+        image_static = render(view, gaussians, pipeline, background, 0, 0, 0, is_6dof)["render"] # static
         results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof)
-        rendering = results["render"]
+        image_dynamic, dynamic_mask = results["render"], results["dynamic"] # dynamic
+        rendering = image_dynamic * dynamic_mask + image_static * (1 - dynamic_mask) # blend
         depth = results["depth"]
-        depth = depth / (depth.max() + 1e-5)
+        depth = depth / (depth.max() + 1e-5) # normalization
 
         gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
+        torchvision.utils.save_image(image_static, os.path.join(static_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(image_dynamic, os.path.join(dynamic_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(dynamic_mask, os.path.join(dynamic_mask_path, '{0:05d}'.format(idx) + ".png"))
 
 def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, deform):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")
@@ -278,9 +293,9 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                 mode: str):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False) # MARK: load gaussians
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
-        deform.load_weights(dataset.model_path)
+        deform.load_weights(dataset.model_path) # MARK: load deformable field weights
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -319,7 +334,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--mode", default='render', choices=['render', 'time', 'view', 'all', 'pose', 'original'])
-    args = get_combined_args(parser)
+    args = get_combined_args(parser) # combined command line arguments and config file arguments
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

@@ -18,8 +18,9 @@ import json
 WARNED = False
 
 
-def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+def loadCam(args, id, cam_info, resolution_scale): # resolution_scale == 1
+    orig_w, orig_h = cam_info.image.size # 800 800
+    # orig_w, orig_h = cam_info.image.shape[:-1] # 400 940 3; MARK: change
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w / (resolution_scale * args.resolution)), round(
@@ -39,14 +40,14 @@ def loadCam(args, id, cam_info, resolution_scale):
             global_down = orig_w / args.resolution
 
         scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale))
+        resolution = (int(orig_w / scale), int(orig_h / scale)) # 800 800
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution) # resize image; 3, 800, 800
 
-    gt_image = resized_image_rgb[:3, ...]
-    loaded_mask = None
+    gt_image = resized_image_rgb[:3, ...] # resized image 
+    loaded_mask = None # resized image mask
 
-    if resized_image_rgb.shape[1] == 4:
+    if resized_image_rgb.shape[0] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,

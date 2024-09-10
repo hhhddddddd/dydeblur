@@ -21,7 +21,7 @@ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
 
 class Scene:
-    gaussians: GaussianModel
+    gaussians: GaussianModel # class attribute
 
     def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True,
                  resolution_scales=[1.0]):
@@ -32,7 +32,7 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
 
-        if load_iteration:
+        if load_iteration:  # initialization self.loaded_iter, according to load_iteration
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
@@ -41,30 +41,42 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        print(args.source_path)
+        if os.path.exists(os.path.join(args.source_path, "sparse")): 
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval) # Colmap
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval) # Blender; D_NeRF
+
         elif os.path.exists(os.path.join(args.source_path, "cameras_sphere.npz")):
             print("Found cameras_sphere.npz file, assuming DTU data set!")
-            scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, "cameras_sphere.npz", "cameras_sphere.npz")
+            scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, "cameras_sphere.npz", "cameras_sphere.npz") # DTU
+
         elif os.path.exists(os.path.join(args.source_path, "dataset.json")):
             print("Found dataset.json file, assuming Nerfies data set!")
-            scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
-            print("Found calibration_full.json, assuming Neu3D data set!")
-            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24)
+            scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, args.eval) # nerfies, hyper-nerf, nerf-ds
+
         elif os.path.exists(os.path.join(args.source_path, "transforms.json")):
             print("Found calibration_full.json, assuming Dynamic-360 data set!")
-            scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path)
+            scene_info = sceneLoadTypeCallbacks["dynamic360"](args.source_path) # Dynamic-360
+
+        elif os.path.exists(os.path.join(args.source_path, "background_mask")):
+            print("Found background_mask, assuming D2RF data set!")
+            scene_info = sceneLoadTypeCallbacks["D2RF"](args.source_path) # D2RF
+
+        elif os.path.exists(os.path.join(args.source_path, "sharp_images")):
+            print("Found sharp_images, assuming DyBluRF data set!")
+            scene_info = sceneLoadTypeCallbacks["DyBluRF"](args.source_path) # DyBluRF
+
+        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
+            print("Found calibration_full.json, assuming Neu3D data set!")
+            scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24) # Neu3D, DyNeRF
         else:
             assert False, "Could not recognize scene type!"
 
-        if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"),
-                                                                   'wb') as dest_file:
+        if not self.loaded_iter: # Output "input.ply" and "cameras.json"
+            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"), 'wb') as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []
             camlist = []
@@ -77,13 +89,13 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
 
-        if shuffle:
+        if shuffle: # True
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.cameras_extent = scene_info.nerf_normalization["radius"] # what's that? spatial_lr_scale
 
-        for resolution_scale in resolution_scales:
+        for resolution_scale in resolution_scales:  # CameraInfo -> Camera; resize image
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
                                                                             args)

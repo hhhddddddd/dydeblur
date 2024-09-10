@@ -22,11 +22,11 @@ BaseImage = collections.namedtuple(
 Point3D = collections.namedtuple(
     "Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
 CAMERA_MODELS = {
-    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
-    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
-    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),
-    CameraModel(model_id=3, model_name="RADIAL", num_params=5),
-    CameraModel(model_id=4, model_name="OPENCV", num_params=8),
+    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),         # focal length, camera center
+    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),                # focal length x, focal length y, camera center
+    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),          # radial distortion parameter
+    CameraModel(model_id=3, model_name="RADIAL", num_params=5),                 #
+    CameraModel(model_id=4, model_name="OPENCV", num_params=8),                 #
     CameraModel(model_id=5, model_name="OPENCV_FISHEYE", num_params=8),
     CameraModel(model_id=6, model_name="FULL_OPENCV", num_params=12),
     CameraModel(model_id=7, model_name="FOV", num_params=5),
@@ -40,7 +40,7 @@ CAMERA_MODEL_NAMES = dict([(camera_model.model_name, camera_model)
                            for camera_model in CAMERA_MODELS])
 
 
-def qvec2rotmat(qvec):
+def qvec2rotmat(qvec): # quaternion vector -> rotation matrix
     return np.array([
         [1 - 2 * qvec[2] ** 2 - 2 * qvec[3] ** 2,
          2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
@@ -53,7 +53,7 @@ def qvec2rotmat(qvec):
          1 - 2 * qvec[1] ** 2 - 2 * qvec[2] ** 2]])
 
 
-def rotmat2qvec(R):
+def rotmat2qvec(R): # rotation matrix -> quaternion vector
     Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
     K = np.array([
         [Rxx - Ryy - Rzz, 0, 0, 0],
@@ -67,7 +67,7 @@ def rotmat2qvec(R):
     return qvec
 
 
-class Image(BaseImage):
+class Image(BaseImage): # Image "inherits" BaseImage
     def qvec2rotmat(self):
         return qvec2rotmat(self.qvec)
 
@@ -171,7 +171,7 @@ def read_intrinsics_text(path):
     return cameras
 
 
-def read_extrinsics_binary(path_to_model_file):
+def read_extrinsics_binary(path_to_model_file): # Extrinsics; MARK: images.bin
     """
     see: src/base/reconstruction.cc
         void Reconstruction::ReadImagesBinary(const std::string& path)
@@ -179,26 +179,26 @@ def read_extrinsics_binary(path_to_model_file):
     """
     images = {}
     with open(path_to_model_file, "rb") as fid:
-        num_reg_images = read_next_bytes(fid, 8, "Q")[0]
+        num_reg_images = read_next_bytes(fid, 8, "Q")[0] # The number of registered camera: nerf_llff_data: 20, D2RF: 34
         for _ in range(num_reg_images):
             binary_image_properties = read_next_bytes(
                 fid, num_bytes=64, format_char_sequence="idddddddi")
-            image_id = binary_image_properties[0]
-            qvec = np.array(binary_image_properties[1:5])
-            tvec = np.array(binary_image_properties[5:8])
-            camera_id = binary_image_properties[8]
-            image_name = ""
+            image_id = binary_image_properties[0]           # image id
+            qvec = np.array(binary_image_properties[1:5])   # quaternion vector
+            tvec = np.array(binary_image_properties[5:8])   # translation vector
+            camera_id = binary_image_properties[8]          # camera id
+            image_name = ""                                 # 'IMG_4026.JPG'  '000000_left.jpg'
             current_char = read_next_bytes(fid, 1, "c")[0]
             while current_char != b"\x00":  # look for the ASCII 0 entry
                 image_name += current_char.decode("utf-8")
                 current_char = read_next_bytes(fid, 1, "c")[0]
             num_points2D = read_next_bytes(fid, num_bytes=8,
-                                           format_char_sequence="Q")[0]
+                                           format_char_sequence="Q")[0] # num_points2D: 11187
             x_y_id_s = read_next_bytes(fid, num_bytes=24 * num_points2D,
-                                       format_char_sequence="ddq" * num_points2D)
+                                       format_char_sequence="ddq" * num_points2D) # x_y_id_s: 33561 == 11187 * 3 (x, y, id)
             xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),
-                                   tuple(map(float, x_y_id_s[1::3]))])
-            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
+                                   tuple(map(float, x_y_id_s[1::3]))]) # 11187, 2
+            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3]))) # 11187
             images[image_id] = Image(
                 id=image_id, qvec=qvec, tvec=tvec,
                 camera_id=camera_id, name=image_name,
@@ -206,7 +206,7 @@ def read_extrinsics_binary(path_to_model_file):
     return images
 
 
-def read_intrinsics_binary(path_to_model_file):
+def read_intrinsics_binary(path_to_model_file): # Intrinsics; MARK: cameras.bin
     """
     see: src/base/reconstruction.cc
         void Reconstruction::WriteCamerasBinary(const std::string& path)
@@ -214,16 +214,16 @@ def read_intrinsics_binary(path_to_model_file):
     """
     cameras = {}
     with open(path_to_model_file, "rb") as fid:
-        num_cameras = read_next_bytes(fid, 8, "Q")[0]
+        num_cameras = read_next_bytes(fid, 8, "Q")[0] # The number of registered camera: 1
         for _ in range(num_cameras):
             camera_properties = read_next_bytes(
                 fid, num_bytes=24, format_char_sequence="iiQQ")
-            camera_id = camera_properties[0]
-            model_id = camera_properties[1]
-            model_name = CAMERA_MODEL_IDS[camera_properties[1]].model_name
-            width = camera_properties[2]
-            height = camera_properties[3]
-            num_params = CAMERA_MODEL_IDS[model_id].num_params
+            camera_id = camera_properties[0]    # 1
+            model_id = camera_properties[1]     # 2
+            model_name = CAMERA_MODEL_IDS[camera_properties[1]].model_name # 'SIMPLE_RADIAL', strange
+            width = camera_properties[2]    # 4032
+            height = camera_properties[3]   # 3024
+            num_params = CAMERA_MODEL_IDS[model_id].num_params # 4
             params = read_next_bytes(fid, num_bytes=8 * num_params,
                                      format_char_sequence="d" * num_params)
             cameras[camera_id] = Camera(id=camera_id,

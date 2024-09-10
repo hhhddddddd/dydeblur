@@ -38,9 +38,9 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     """
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0 # gs_num, 3; dtype == torch.float32
     try:
-        screenspace_points.retain_grad()
+        screenspace_points.retain_grad() # retain gradient
     except:
         pass
 
@@ -56,7 +56,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
         bg=bg_color,
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
-        projmatrix=viewpoint_camera.full_proj_transform,
+        projmatrix=viewpoint_camera.full_proj_transform, # MARK: projection matrix
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
@@ -66,7 +66,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
     if is_6dof:
-        if torch.is_tensor(d_xyz) is False:
+        if torch.is_tensor(d_xyz) is False: # judge whether warm_up
             means3D = pc.get_xyz
         else:
             means3D = from_homogenous(
@@ -93,18 +93,18 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     colors_precomp = None
     if colors_precomp is None:
         if pipe.convert_SHs_python:
-            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
-            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2)             # torch.Size([gs_num, 3, 16])
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))      # torch.Size([gs_num, 3])
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)                                   # torch.Size([gs_num, 3])
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)                              # torch.Size([gs_num, 3])
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)                                             # torch.Size([gs_num, 3])
         else:
-            shs = pc.get_features
+            shs = pc.get_features   # torch.Size([gs_num, 16, 3])
     else:
         colors_precomp = override_color
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth = rasterizer(
+    rendered_image, radii, depth = rasterizer(  # more depth than 3dgs
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -114,10 +114,22 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
         rotations=rotations,
         cov3D_precomp=cov3D_precomp)
 
+    dynamic_precomp = torch.cat((pc.get_dynamic, torch.zeros_like(pc.get_dynamic).expand(-1, 2)), dim=-1)
+    dynamic_mask, *_ = rasterizer(  # more depth than 3dgs
+        means3D=means3D,
+        means2D=means2D,
+        shs=None,
+        colors_precomp=dynamic_precomp,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=cov3D_precomp)
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter": radii > 0,
-            "radii": radii,
-            "depth": depth}
+    return {"render": rendered_image,                   # torch.Size([3, 800, 800])
+            "viewspace_points": screenspace_points,     # torch.Size([gs_num, 3])
+            "visibility_filter": radii > 0,             # torch.Size([gs_num])
+            "radii": radii,                             # torch.Size([gs_num])
+            "depth": depth,                             # torch.Size([1, 800, 800])
+            "dynamic": dynamic_mask[0, ...]}                             

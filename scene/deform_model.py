@@ -11,12 +11,12 @@ class DeformModel:
     def __init__(self, is_blender=False, is_6dof=False):
         self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda()
         self.optimizer = None
-        self.spatial_lr_scale = 5
+        self.spatial_lr_scale = 5   # scale factor: Adjusts the learning rate scaling for different spatial locations
 
     def step(self, xyz, time_emb):
-        return self.deform(xyz, time_emb)
+        return self.deform(xyz, time_emb) # DeformNetwork.forward
 
-    def train_setting(self, training_args):
+    def train_setting(self, training_args): # Initialize the optimizer and the learning rate scheduler; training_args: opt
         l = [
             {'params': list(self.deform.parameters()),
              'lr': training_args.position_lr_init * self.spatial_lr_scale,

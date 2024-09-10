@@ -21,8 +21,8 @@ def inverse_sigmoid(x):
 
 
 def PILtoTorch(pil_image, resolution):
-    resized_image_PIL = pil_image.resize(resolution)
-    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+    resized_image_PIL = pil_image.resize(resolution) # 800, 800
+    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0 # 800, 800, 3
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
@@ -163,7 +163,7 @@ def build_scaling_rotation(s, r):
     return L
 
 
-def safe_state(silent):
+def safe_state(silent): # print function
     old_f = sys.stdout
 
     class F:

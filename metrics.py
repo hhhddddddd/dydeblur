@@ -48,12 +48,12 @@ def evaluate(model_paths):
             print("Scene:", scene_dir)
             full_dict[scene_dir] = {}
             per_view_dict[scene_dir] = {}
-            full_dict_polytopeonly[scene_dir] = {}
-            per_view_dict_polytopeonly[scene_dir] = {}
+            full_dict_polytopeonly[scene_dir] = {} # useless
+            per_view_dict_polytopeonly[scene_dir] = {} # useless
 
-            test_dir = Path(scene_dir) / "test"
+            test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test)
 
-            for method in os.listdir(test_dir):
+            for method in os.listdir(test_dir): # ours_40000
                 if not method.startswith("ours"):
                     continue
                 print("Method:", method)
@@ -63,9 +63,9 @@ def evaluate(model_paths):
                 full_dict_polytopeonly[scene_dir][method] = {}
                 per_view_dict_polytopeonly[scene_dir][method] = {}
 
-                method_dir = test_dir / method
-                gt_dir = method_dir / "gt"
-                renders_dir = method_dir / "renders"
+                method_dir = test_dir / method # PosixPath('output/D_NeRF/trex/test/ours_40000)
+                gt_dir = method_dir / "gt" # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)
+                renders_dir = method_dir / "blend" # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
 
                 ssims = []
@@ -91,9 +91,9 @@ def evaluate(model_paths):
                      "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
 
             with open(scene_dir + "/results.json", 'w') as fp:
-                json.dump(full_dict[scene_dir], fp, indent=True)
+                json.dump(full_dict[scene_dir], fp, indent=True)        # MARK: output
             with open(scene_dir + "/per_view.json", 'w') as fp:
-                json.dump(per_view_dict[scene_dir], fp, indent=True)
+                json.dump(per_view_dict[scene_dir], fp, indent=True)    # MARK: output
         except:
             print("Unable to compute metrics for model", scene_dir)
 

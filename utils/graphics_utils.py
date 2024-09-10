@@ -31,15 +31,15 @@ def geom_transform_points(points, transf_matrix):
     return (points_out[..., :3] / denom).squeeze(dim=0)
 
 
-def getWorld2View(R, t):
+def getWorld2View(R, t): # world -> camera
     Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose()
+    Rt[:3, :3] = R.transpose() # why transpose?
     Rt[:3, 3] = t
     Rt[3, 3] = 1.0
     return np.float32(Rt)
 
 
-def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
+def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0): # world -> camera
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = R.transpose()
     Rt[:3, 3] = t
@@ -76,9 +76,9 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     return P
 
 
-def fov2focal(fov, pixels):
+def fov2focal(fov, pixels): # field of view -> focal
     return pixels / (2 * math.tan(fov / 2))
 
 
-def focal2fov(focal, pixels):
+def focal2fov(focal, pixels): # focal -> field of view
     return 2 * math.atan(pixels / (2 * focal))

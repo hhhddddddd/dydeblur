@@ -47,7 +47,7 @@ class ParamGroup:
         return group
 
 
-class ModelParams(ParamGroup):
+class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -68,7 +68,7 @@ class ModelParams(ParamGroup):
         return g
 
 
-class PipelineParams(ParamGroup):
+class PipelineParams(ParamGroup): # PipelineParams inherits ParamGroup
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
@@ -76,7 +76,7 @@ class PipelineParams(ParamGroup):
         super().__init__(parser, "Pipeline Parameters")
 
 
-class OptimizationParams(ParamGroup):
+class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
     def __init__(self, parser):
         self.iterations = 40_000
         self.warm_up = 3_000
@@ -89,6 +89,7 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
+        self.dynamic_lr = 0.001
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100
@@ -99,9 +100,9 @@ class OptimizationParams(ParamGroup):
         super().__init__(parser, "Optimization Parameters")
 
 
-def get_combined_args(parser: ArgumentParser):
-    cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
+def get_combined_args(parser: ArgumentParser): # combined command line arguments and config file arguments
+    cmdlne_string = sys.argv[1:]        # command line arguments
+    cfgfile_string = "Namespace()"      # config file arguments
     args_cmdline = parser.parse_args(cmdlne_string)
 
     try:

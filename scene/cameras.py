@@ -35,13 +35,13 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
             self.data_device = torch.device("cuda")
 
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
+        self.original_image = image.clamp(0.0, 1.0).to(self.data_device) # resized image -> original image
         self.fid = torch.Tensor(np.array([fid])).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
         self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None
 
-        if gt_alpha_mask is not None:
+        if gt_alpha_mask is not None: # MARK: mask process
             self.original_image *= gt_alpha_mask.to(self.data_device)
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)

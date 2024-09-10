@@ -5,7 +5,7 @@ from utils.rigid_utils import exp_se3
 
 
 def get_embedder(multires, i=1):
-    if i == -1:
+    if i == -1: # no Positional Encoding is performed
         return nn.Identity(), 3
 
     embed_kwargs = {
@@ -55,18 +55,18 @@ class Embedder:
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
 
-class DeformNetwork(nn.Module):
+class DeformNetwork(nn.Module): # DeformNetwork inherit from nn.Module
     def __init__(self, D=8, W=256, input_ch=3, output_ch=59, multires=10, is_blender=False, is_6dof=False):
-        super(DeformNetwork, self).__init__()
-        self.D = D
-        self.W = W
-        self.input_ch = input_ch
-        self.output_ch = output_ch
-        self.t_multires = 6 if is_blender else 10
-        self.skips = [D // 2]
+        super(DeformNetwork, self).__init__() # Call the "__init__()" of the parent class (nn.Module)
+        self.D = D  # network depth
+        self.W = W  # network width
+        self.input_ch = input_ch    # 3
+        self.output_ch = output_ch  # 59 ????
+        self.t_multires = 6 if is_blender else 10   # self.t_multires: time positional encoding hyper-parameter
+        self.skips = [D // 2]   # skip connection
 
-        self.embed_time_fn, time_input_ch = get_embedder(self.t_multires, 1)
-        self.embed_fn, xyz_input_ch = get_embedder(multires, 3)
+        self.embed_time_fn, time_input_ch = get_embedder(self.t_multires, 1)    # positional encoding function
+        self.embed_fn, xyz_input_ch = get_embedder(multires, 3)                 # positional encoding function
         self.input_ch = xyz_input_ch + time_input_ch
 
         if is_blender:
@@ -94,19 +94,20 @@ class DeformNetwork(nn.Module):
         self.is_6dof = is_6dof
 
         if is_6dof:
-            self.branch_w = nn.Linear(W, 3)
-            self.branch_v = nn.Linear(W, 3)
+            self.branch_w = nn.Linear(W, 3)         # output branch_w function
+            self.branch_v = nn.Linear(W, 3)         # output branch_v function
         else:
-            self.gaussian_warp = nn.Linear(W, 3)
-        self.gaussian_rotation = nn.Linear(W, 4)
-        self.gaussian_scaling = nn.Linear(W, 3)
+            self.gaussian_warp = nn.Linear(W, 3)    # output d_x function
+        self.gaussian_rotation = nn.Linear(W, 4)    # output d_r function
+        self.gaussian_scaling = nn.Linear(W, 3)     # output d_s function
+        self.gaussian_dynamic = nn.Linear(W, 1)  
 
     def forward(self, x, t):
-        t_emb = self.embed_time_fn(t)
+        t_emb = self.embed_time_fn(t)           # time positional encoding
         if self.is_blender:
-            t_emb = self.timenet(t_emb)  # better for D-NeRF Dataset
-        x_emb = self.embed_fn(x)
-        h = torch.cat([x_emb, t_emb], dim=-1)
+            t_emb = self.timenet(t_emb)         # better for D-NeRF Dataset
+        x_emb = self.embed_fn(x)                # space positional encoding
+        h = torch.cat([x_emb, t_emb], dim=-1)   # concat
         for i, l in enumerate(self.linear):
             h = self.linear[i](h)
             h = F.relu(h)
@@ -114,16 +115,17 @@ class DeformNetwork(nn.Module):
                 h = torch.cat([x_emb, t_emb, h], -1)
 
         if self.is_6dof:
-            w = self.branch_w(h)
-            v = self.branch_v(h)
+            w = self.branch_w(h)    # compute rotation parameter
+            v = self.branch_v(h)    # compute scale parameter
             theta = torch.norm(w, dim=-1, keepdim=True)
-            w = w / theta + 1e-5
-            v = v / theta + 1e-5
+            w = w / theta + 1e-5    # normalization
+            v = v / theta + 1e-5    # normalization
             screw_axis = torch.cat([w, v], dim=-1)
             d_xyz = exp_se3(screw_axis, theta)
         else:
             d_xyz = self.gaussian_warp(h)
         scaling = self.gaussian_scaling(h)
         rotation = self.gaussian_rotation(h)
+        dynamic = self.gaussian_dynamic(h)
 
-        return d_xyz, rotation, scaling
+        return d_xyz, rotation, scaling, dynamic
