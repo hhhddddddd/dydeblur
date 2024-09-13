@@ -733,8 +733,8 @@ def readDyBluRFCameras(path):
     imgdir = os.path.join(path, 'images_512x288') 
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # blur image path
-    imgdir_sharp = os.path.join(path, 'sharp_images')
-    imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
+    imgdir_inference = os.path.join(path, 'inference_images')
+    imgfiles_inference = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # sharp image path
     
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
@@ -759,7 +759,7 @@ def readDyBluRFCameras(path):
         if idx % 2 == 0:
             img_path = imgfiles[idx // 2]
         else:
-            img_path = imgfiles_sharp[idx // 2] # MARK: resolution
+            img_path = imgfiles_inference[idx // 2] # MARK: resolution
         img = Image.open(img_path)  # 400, 940, 3; MARK: load image
         image_name = os.path.basename(img_path).split(".")[0] # 00000
         

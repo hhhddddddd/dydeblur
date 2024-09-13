@@ -10,7 +10,7 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '1' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
 import time
 import torch
 from random import randint
