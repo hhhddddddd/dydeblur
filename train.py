@@ -10,7 +10,8 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '1' # MARK: GPU
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence # what is kl_divergence?
@@ -88,7 +89,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         if dataset.load2gpu_on_the_fly:
             viewpoint_cam.load2device()     # accelerate: move camera data to the GPU
         total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
-        fid = viewpoint_cam.fid             # what is fid? A: torch.Size([1]), maybe input_time!
+        fid = viewpoint_cam.fid             # input time
 
         if iteration == opt.warm_up:        # for debug
             print("iteration is ok")
@@ -116,8 +117,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         Ll1_dynamic = l1_loss(image_dynamic, gt_image)
-        # Ll1_static = l1_loss((1 - dynamic_mask) * image_static , (1 - dynamic_mask) * gt_image)
-        loss = (1.0 - opt.lambda_dssim) * (0.5 * Ll1 + 0.5 * Ll1_dynamic) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # opt.lambda_dssim == 0.2
+        Ll1_static = l1_loss((1 - dynamic_mask) * image_static , (1 - dynamic_mask) * gt_image)
+        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic + Ll1_static) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # opt.lambda_dssim == 0.2
         loss.backward()
 
         iter_end.record()   # record end time
@@ -127,7 +128,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log # MARK: ema_loss
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
                 progress_bar.update(10)
@@ -193,14 +194,15 @@ def prepare_output_and_logger(args): # TensorBoard writer
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(os.path.join(args.model_path,"tb_logs")) # 'output/dydeblur/D_NeRF/trex/tb_logs'
+        starttime = time.strftime("%Y-%m-%d_%H:%M:%S")
+        tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:13]), comment=starttime[:13], flush_secs=60)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc,
-                    renderArgs, deform, load2gpu_on_the_fly, is_6dof=False):
+                    renderArgs, deform, load2gpu_on_the_fly, is_6dof=False): # renderFunc == render
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -226,18 +228,30 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     xyz = scene.gaussians.get_xyz
                     time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
                     d_xyz, d_rotation, d_scaling, dynamic = deform.step(xyz.detach(), time_input)
-                    image = torch.clamp(
-                        renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)["render"],
-                        0.0, 1.0)
+
+                    ret_static = renderFunc(viewpoint, scene.gaussians, *renderArgs, 0, 0, 0, is_6dof)
+                    ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)
+                    image_static = torch.clamp(ret_static["render"],0.0, 1.0)
+                    image_dynamic = torch.clamp(ret["render"],0.0, 1.0)
+                    dynamic_mask = ret["dynamic"]
+                    image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static
+
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     images = torch.cat((images, image.unsqueeze(0)), dim=0)
-                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)
+                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)         
 
                     if load2gpu_on_the_fly:
                         viewpoint.load2device('cpu') # restore: move camera data to the CPU
-                    if tb_writer and (idx < 5): # if range(5, 30, 5): 'idx < 5' is impossible
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
-                                             image[None], global_step=iteration)
+                    if tb_writer and (idx < 5): # Show only the first 5 images
+                        tb_writer.add_images(config['name'] + "_view_{}/dynamic".format(viewpoint.image_name),
+                                             image_dynamic[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
+                                             dynamic_mask, global_step=iteration, dataformats='HW') 
+                        tb_writer.add_images(config['name'] + "_view_{}/static".format(viewpoint.image_name),
+                                             image_static[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/blend".format(viewpoint.image_name),
+                                             image[None], global_step=iteration) 
+                       
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
@@ -253,6 +267,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+            tb_writer.add_histogram("scene/dynamic_histogram", scene.gaussians.get_dynamic, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache() # clearing GPU memory
 

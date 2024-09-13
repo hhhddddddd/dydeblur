@@ -3,7 +3,7 @@
 '''train
 '''
 
-python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex --eval --is_blender # D_NeRF
+python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex -o test --eval --is_blender # D_NeRF
 
 '''render
 '''

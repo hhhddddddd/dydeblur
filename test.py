@@ -1,40 +1,4 @@
-class CameraInfo:
-    def __init__(self, image_name):
-        self.image_name = image_name
-
-cam_infos_unsorted = [
-    CameraInfo("1_left.jpg"),
-    CameraInfo("2_right.jpg"),
-    CameraInfo("1_right.jpg"),
-    CameraInfo("2_left.jpg"),
-]
-
-cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
-
-
-for cam_info in cam_infos:
-    print(cam_info.image_name)
-
-class CameraInfo(NamedTuple):
-    uid: int            # index, Intrinsics
-    R: np.array
-    T: np.array
-    FovY: np.array
-    FovX: np.array
-    image: np.array
-    image_path: str
-    image_name: str
-    width: int
-    height: int
-    fid: float          # frame time
-    depth: Optional[np.array] = None
-
-
-class SceneInfo(NamedTuple):
-    point_cloud: BasicPointCloud
-    train_cameras: list
-    test_cameras: list
-    nerf_normalization: dict
-    ply_path: str
-
-print('hello world!')
+import time
+starttime = time.strftime("%Y-%m-%d_%H:%M:%S")#时间格式可以自定义，如果需要定义到分钟记得改下冒号，否则输入logdir时候会出问题
+print("Start experiment:", starttime)#定义实验时间
+writer = SummaryWriter(log_dir="./log/",comment=starttime[:13],flush_secs=60)
