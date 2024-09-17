@@ -57,6 +57,9 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.dynamic_activation = torch.sigmoid
         self.inverse_dynamic_activation = inverse_sigmoid
 
+        # self.dynamic_activation = torch.nn.Identity()
+        # self.inverse_dynamic_activation = torch.nn.Identity()
+
         self.rotation_activation = torch.nn.functional.normalize # strange
 
     @property

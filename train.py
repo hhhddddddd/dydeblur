@@ -10,7 +10,7 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
 import time
 import torch
 from random import randint
@@ -28,7 +28,8 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    TENSORBOARD_FOUND = True
+    TENSORBOARD_FOUND = True # MARK: switch tb_writer
+    # TENSORBOARD_FOUND = False
 except ImportError:
     TENSORBOARD_FOUND = False
 
@@ -90,35 +91,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
             viewpoint_cam.load2device()     # accelerate: move camera data to the GPU
         total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
         fid = viewpoint_cam.fid             # input time
-
-        if iteration == opt.warm_up:        # for debug
-            print("iteration is ok")
         
         if iteration < opt.warm_up:         # warm_up: maybe for static region
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
             N = gaussians.get_xyz.shape[0]  # current gaussian quantity, eg: 10587
+            # print(N)
             time_input = fid.unsqueeze(0).expand(N, -1) # Expand the input in the time dimension, eg:torch.Size([10587,1])
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration) # for time_input; why do this?
-            d_xyz, d_rotation, d_scaling, dynamic = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
-            gaussians._dynamic = dynamic
+            d_xyz, d_rotation, d_scaling, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
+            dynamic = torch.sum(d_xyz.detach().abs(), dim=1) # add
+            dynamic = (dynamic - dynamic.mean()) * 3.0 / dynamic.std() # Z-Score normalize, scale-factor
+            # dynamic = (dynamic - dynamic.min()) / (dynamic.max() - dynamic.min()) # Max-min normalize
+            gaussians._dynamic = 0.4 * gaussians._dynamic.detach() + 0.6 * dynamic[..., None]
+            # gaussians._dynamic = dynamic[..., None]
 
         # Render
         render_pkg_re_static = render(viewpoint_cam, gaussians, pipe, background, 0, 0, 0, dataset.is_6dof)                 # static
-        image_static = render_pkg_re_static["render"] # 3, 800, 800
+        image_static, dynamic_mask_static = render_pkg_re_static["render"], render_pkg_re_static["dynamic"] # 3, 800, 800
         render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)   # dynamic
         image_dynamic, viewspace_point_tensor, visibility_filter, radii, dynamic_mask = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["dynamic"]
+        # dynamic_mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
+        dynamic_mask = torch.clamp(dynamic_mask, 0.0, 1.0)
         image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static                                            # blend
-        # depth = render_pkg_re["depth"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         Ll1_dynamic = l1_loss(image_dynamic, gt_image)
-        Ll1_static = l1_loss((1 - dynamic_mask) * image_static , (1 - dynamic_mask) * gt_image)
-        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic + Ll1_static) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # opt.lambda_dssim == 0.2
+        # Ll1_static = l1_loss((1 - dynamic_mask.detach()) * image_static , (1 - dynamic_mask.detach()) * gt_image)
+        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # opt.lambda_dssim == 0.2
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
 
         iter_end.record()   # record end time
@@ -195,7 +200,7 @@ def prepare_output_and_logger(args): # TensorBoard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         starttime = time.strftime("%Y-%m-%d_%H:%M:%S")
-        tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:13]), comment=starttime[:13], flush_secs=60)
+        tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
