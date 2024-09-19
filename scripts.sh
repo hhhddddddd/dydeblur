@@ -8,9 +8,9 @@ python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex -o dynamic --
 '''render
 '''
 
-python render.py -m output/dydeblur/D_NeRF/trex --mode render # D_NeRF
+# python render.py -m output/dydeblur/D_NeRF/trex -o dynamic -t --mode render # D_NeRF
 
 '''test
 '''
 
-python metrics.py -m output/dydeblur/D_NeRF/trex # D_NeRF
+# python metrics.py -m output/dydeblur/D_NeRF/trex # D_NeRF

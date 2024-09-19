@@ -9,7 +9,7 @@ from utils.general_utils import get_expon_lr_func
 
 class DeformModel:
     def __init__(self, is_blender=False, is_6dof=False):
-        self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda()
+        self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda() # MARK: cuda
         self.optimizer = None
         self.spatial_lr_scale = 5   # scale factor: Adjusts the learning rate scaling for different spatial locations
 
@@ -29,17 +29,17 @@ class DeformModel:
                                                        lr_delay_mult=training_args.position_lr_delay_mult,
                                                        max_steps=training_args.deform_lr_max_steps)
 
-    def save_weights(self, model_path, iteration):
-        out_weights_path = os.path.join(model_path, "deform/iteration_{}".format(iteration))
+    def save_weights(self, model_path, iteration, starttime, operate):
+        out_weights_path = os.path.join(model_path, operate, starttime[:16], "deform/iteration_{}".format(iteration))
         os.makedirs(out_weights_path, exist_ok=True)
         torch.save(self.deform.state_dict(), os.path.join(out_weights_path, 'deform.pth'))
 
-    def load_weights(self, model_path, iteration=-1):
+    def load_weights(self, model_path, operate, time, iteration=-1):
         if iteration == -1:
             loaded_iter = searchForMaxIteration(os.path.join(model_path, "deform"))
         else:
             loaded_iter = iteration
-        weights_path = os.path.join(model_path, "deform/iteration_{}/deform.pth".format(loaded_iter))
+        weights_path = os.path.join(model_path, operate, time, "deform/iteration_{}/deform.pth".format(loaded_iter))
         self.deform.load_state_dict(torch.load(weights_path))
 
     def update_learning_rate(self, iteration):

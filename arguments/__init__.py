@@ -53,6 +53,7 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self._source_path = ""
         self._model_path = ""
         self._operate = ""
+        self._time = ""
         self._images = "images"
         self._resolution = -1
         self._white_background = False
@@ -86,6 +87,7 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.deform_lr_max_steps = 40_000
+        self.dynamic_lr_max_steps = 40_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001

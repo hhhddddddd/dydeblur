@@ -107,7 +107,7 @@ class DeformNetwork(nn.Module): # DeformNetwork inherit from nn.Module
         if self.is_blender:
             t_emb = self.timenet(t_emb)         # better for D-NeRF Dataset
         x_emb = self.embed_fn(x)                # space positional encoding
-        h = torch.cat([x_emb, t_emb], dim=-1)   # concat
+        h = torch.cat([x_emb, t_emb], dim=-1)   # concat, torch.Size([100000, 93]) 21 * 3 + 30
         for i, l in enumerate(self.linear):
             h = self.linear[i](h)
             h = F.relu(h)

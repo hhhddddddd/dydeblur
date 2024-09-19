@@ -16,6 +16,7 @@ from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from scene.deform_model import DeformModel
+from scene.mlp_model import MLP
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -34,7 +35,7 @@ class Scene:
 
         if load_iteration:  # initialization self.loaded_iter, according to load_iteration
             if load_iteration == -1:
-                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
+                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, args.operate, args.time, "point_cloud"))
             else:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
@@ -76,7 +77,7 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter: # Output "input.ply" and "cameras.json"
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"), 'wb') as dest_file:
+            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"), 'wb') as dest_file: # MARK: input.ply
                 dest_file.write(src_file.read())
             json_cams = []
             camlist = []
@@ -86,7 +87,7 @@ class Scene:
                 camlist.extend(scene_info.train_cameras)
             for id, cam in enumerate(camlist):
                 json_cams.append(camera_to_JSON(id, cam))
-            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
+            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file: # MARK: cameras.json
                 json.dump(json_cams, file)
 
         if shuffle: # True
@@ -104,7 +105,7 @@ class Scene:
                                                                            args)
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
+            self.gaussians.load_ply(os.path.join(self.model_path, args.operate, args.time,
                                                  "point_cloud",
                                                  "iteration_" + str(self.loaded_iter),
                                                  "point_cloud.ply"),
@@ -112,9 +113,17 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
-    def save(self, iteration):
-        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+    def save(self, iteration, starttime, operate):
+        point_cloud_path = os.path.join(self.model_path, operate, starttime[:16], "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+
+    def save_learn(self, iteration, canonical):
+        if canonical:
+            point_cloud_path = os.path.join(self.model_path, "deformation/iteration_{}".format(iteration))
+            self.gaussians.save_ply(os.path.join(point_cloud_path, "canonical.ply"))
+        else:
+            point_cloud_path = os.path.join(self.model_path, "deformation/iteration_{}".format(iteration))
+            self.gaussians.save_ply(os.path.join(point_cloud_path, "deformation.ply"))            
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

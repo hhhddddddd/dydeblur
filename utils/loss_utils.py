@@ -74,3 +74,8 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
         return ssim_map.mean()
     else:
         return ssim_map.mean(1).mean(1).mean(1)
+    
+def adaptive_binary_crossentropy(dynamic):
+    target = (dynamic > 0.5).float()
+    loss = - (target * torch.log(dynamic) + (1 - target) * torch.log(1 - dynamic))
+    return loss.mean()

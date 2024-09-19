@@ -295,7 +295,7 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
         gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False) # MARK: load gaussians
         deform = DeformModel(dataset.is_blender, dataset.is_6dof)
-        deform.load_weights(dataset.model_path) # MARK: load deformable field weights
+        deform.load_weights(dataset.model_path, dataset.operate, dataset.time) # MARK: load deformable field weights
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

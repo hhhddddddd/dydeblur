@@ -10,14 +10,14 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
 import time
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, kl_divergence # what is kl_divergence?
+from utils.loss_utils import l1_loss, ssim, adaptive_binary_crossentropy
 from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel, DeformModel
+from scene import Scene, GaussianModel, DeformModel, MLP
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 from tqdm import tqdm
@@ -35,10 +35,13 @@ except ImportError:
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: dataset,  op: opt,  pp: pipe,
-    tb_writer = prepare_output_and_logger(dataset) # TensorBoard
+    starttime = time.strftime("%Y-%m-%d_%H:%M:%S") # train start time
+    tb_writer = prepare_output_and_logger(dataset, starttime) # TensorBoard
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof) # DeformModel contains DeformNetwork
     deform.train_setting(opt) # Initialize the optimizer and the learning rate scheduler
+    dynamic_mlp = MLP(input_ch=3, output_ch=1)
+    dynamic_mlp.train_setting(opt)
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt) # Initialize the optimizer and the learning rate scheduler
@@ -92,7 +95,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
         fid = viewpoint_cam.fid             # input time
         
-        if iteration < opt.warm_up:         # warm_up: maybe for static region
+        # opt.warm_up = 1000
+        if iteration < opt.warm_up:         # warm_up == 3000; maybe for static region
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
             N = gaussians.get_xyz.shape[0]  # current gaussian quantity, eg: 10587
@@ -101,20 +105,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration) # for time_input; why do this?
             d_xyz, d_rotation, d_scaling, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
-            dynamic = torch.sum(d_xyz.detach().abs(), dim=1) # add
-            dynamic = (dynamic - dynamic.mean()) * 3.0 / dynamic.std() # Z-Score normalize, scale-factor
+            # dynamic = dynamic_mlp(torch.cat((d_xyz.detach(), d_rotation.detach(), d_scaling.detach()), dim=-1)) # mlp
+            dynamic = dynamic_mlp(d_xyz.detach()) # mlp
+            # print(dynamic.mean().item(),dynamic.std().item())
+
+            # dynamic = torch.sum(d_xyz.detach().abs(), dim=1) # add
+            dynamic = (dynamic - dynamic.mean()) * 2.0 / (dynamic.std() + 1e-12) # Z-Score normalize, scale-factor == 2
             # dynamic = (dynamic - dynamic.min()) / (dynamic.max() - dynamic.min()) # Max-min normalize
-            gaussians._dynamic = 0.4 * gaussians._dynamic.detach() + 0.6 * dynamic[..., None]
-            # gaussians._dynamic = dynamic[..., None]
+            scene.gaussians._dynamic = 0.4 * scene.gaussians._dynamic.detach() + 0.6 * dynamic
+            # gaussians._dynamic = 0.4 * gaussians._dynamic + 0.6 * dynamic[..., None]
+            # gaussians._dynamic = dynamic
+            # print('after')
+            # print(gaussians._dynamic.mean().item(),gaussians._dynamic.std().item())
 
         # Render
         render_pkg_re_static = render(viewpoint_cam, gaussians, pipe, background, 0, 0, 0, dataset.is_6dof)                 # static
         image_static, dynamic_mask_static = render_pkg_re_static["render"], render_pkg_re_static["dynamic"] # 3, 800, 800
+        # if iteration in saving_iterations: scene.save_learn(iteration, True) # save point clouds
         render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)   # dynamic
         image_dynamic, viewspace_point_tensor, visibility_filter, radii, dynamic_mask = render_pkg_re["render"], render_pkg_re[
             "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["dynamic"]
+        # if iteration in saving_iterations: scene.save_learn(iteration, False) # save point clouds
         # dynamic_mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
         dynamic_mask = torch.clamp(dynamic_mask, 0.0, 1.0)
+        # TODO: assert dynamic_mask whether need torch.clamp
         image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static                                            # blend
 
         # Loss
@@ -122,7 +136,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         Ll1 = l1_loss(image, gt_image)
         Ll1_dynamic = l1_loss(image_dynamic, gt_image)
         # Ll1_static = l1_loss((1 - dynamic_mask.detach()) * image_static , (1 - dynamic_mask.detach()) * gt_image)
-        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # opt.lambda_dssim == 0.2
+        dynamic_01loss = adaptive_binary_crossentropy(scene.gaussians.get_dynamic)
+        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic) + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + 0.05 * dynamic_01loss # opt.lambda_dssim == 0.2
         # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
 
@@ -155,8 +170,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)                               # save 3d scene (point cloud)
-                deform.save_weights(args.model_path, iteration)     # save deformable filed
+                scene.save(iteration, starttime, dataset.operate)                                   # save 3d scene (point cloud)
+                deform.save_weights(args.model_path, iteration, starttime, dataset.operate)         # save deformable filed
+                # dynamic_mlp.save_weights(args.model_path, iteration)    # save dynamic filed (maybe useless)
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -175,6 +191,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                 gaussians.optimizer.step()
                 gaussians.update_learning_rate(iteration)
                 deform.optimizer.step()
+                dynamic_mlp.optimizer.step()
+                dynamic_mlp.optimizer.zero_grad()
+                dynamic_mlp.update_learning_rate(iteration)
                 gaussians.optimizer.zero_grad(set_to_none=True) # clear gradient, every iteration clear gradient
                 deform.optimizer.zero_grad() # deform also needs to clear gradient
                 deform.update_learning_rate(iteration)
@@ -182,7 +201,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
     print("Best PSNR = {} in Iteration {}".format(best_psnr, best_iteration))
 
 
-def prepare_output_and_logger(args): # TensorBoard writer
+def prepare_output_and_logger(args, starttime): # TensorBoard writer
     if not args.model_path: # If no 'args.model_path' is provided
         if os.getenv('OAR_JOB_ID'):
             unique_str = os.getenv('OAR_JOB_ID')
@@ -199,7 +218,6 @@ def prepare_output_and_logger(args): # TensorBoard writer
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        starttime = time.strftime("%Y-%m-%d_%H:%M:%S")
         tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
     else:
         print("Tensorboard not available: not logging progress")
@@ -238,7 +256,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)
                     image_static = torch.clamp(ret_static["render"],0.0, 1.0)
                     image_dynamic = torch.clamp(ret["render"],0.0, 1.0)
+                    dynamic_mask_static = ret_static["dynamic"]
                     dynamic_mask = ret["dynamic"]
+                    mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
                     image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static
 
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -252,6 +272,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                                              image_dynamic[None], global_step=iteration)
                         tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
                                              dynamic_mask, global_step=iteration, dataformats='HW') 
+                        tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask_static".format(viewpoint.image_name),
+                                             dynamic_mask_static, global_step=iteration, dataformats='HW') 
+                        tb_writer.add_images(config['name'] + "_view_{}/mask".format(viewpoint.image_name),
+                                             mask, global_step=iteration, dataformats='HW') 
                         tb_writer.add_images(config['name'] + "_view_{}/static".format(viewpoint.image_name),
                                              image_static[None], global_step=iteration)
                         tb_writer.add_images(config['name'] + "_view_{}/blend".format(viewpoint.image_name),
@@ -290,7 +314,8 @@ if __name__ == "__main__":
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
                         default=[5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
+    # parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[40000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])          # Namespace
     args.save_iterations.append(args.iterations)    # save the last iteration

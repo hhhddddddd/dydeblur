@@ -63,9 +63,9 @@ def evaluate(model_paths):
                 full_dict_polytopeonly[scene_dir][method] = {}
                 per_view_dict_polytopeonly[scene_dir][method] = {}
 
-                method_dir = test_dir / method # PosixPath('output/D_NeRF/trex/test/ours_40000)
-                gt_dir = method_dir / "gt" # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)
-                renders_dir = method_dir / "blend" # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)
+                method_dir = test_dir / method      # PosixPath('output/D_NeRF/trex/test/ours_40000)
+                gt_dir = method_dir / "gt"          # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
+                renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)  MARK: target
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
 
                 ssims = []
