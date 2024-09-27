@@ -38,7 +38,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     """
 
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0 # gs_num, 3; dtype == torch.float32
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0 # [gs_num, 3]; dtype == torch.float32
     try:
         screenspace_points.retain_grad() # retain gradient
     except:
@@ -82,7 +82,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp = pc.get_covariance(scaling_modifier) # the only use of get_covariance
     else:
         scales = pc.get_scaling + d_scaling
         rotations = pc.get_rotation + d_rotation
@@ -128,7 +128,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image,                   # torch.Size([3, 800, 800])
-            "viewspace_points": screenspace_points,     # torch.Size([gs_num, 3])
+            "viewspace_points": screenspace_points,     # torch.Size([gs_num, 3]) x, y, useless
             "visibility_filter": radii > 0,             # torch.Size([gs_num])
             "radii": radii,                             # torch.Size([gs_num])
             "depth": depth,                             # torch.Size([1, 800, 800])

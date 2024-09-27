@@ -29,7 +29,7 @@ class Camera(nn.Module):
         self.image_name = image_name
 
         try:
-            self.data_device = torch.device(data_device)
+            self.data_device = torch.device(data_device) # MARK: cuda
         except Exception as e:
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
@@ -49,15 +49,15 @@ class Camera(nn.Module):
         self.zfar = 100.0
         self.znear = 0.01
 
-        self.trans = trans
-        self.scale = scale
+        self.trans = trans # camera center translation
+        self.scale = scale # camera center scale
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).to(
-            self.data_device)
+            self.data_device) # W2C, 4x4
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
-                                                     fovY=self.FoVy).transpose(0, 1).to(self.data_device)
+                                                     fovY=self.FoVy).transpose(0, 1).to(self.data_device) # ProjectionMatrix
         self.full_proj_transform = (
-            self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
+            self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0) # World coordinate -> image coordinate 
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
     def reset_extrinsic(self, R, T):

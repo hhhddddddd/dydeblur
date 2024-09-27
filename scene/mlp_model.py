@@ -1,39 +1,12 @@
 import os
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
-
-# K-nearest neighbor
-import pdbr
-import time
-import numpy as np
-from sklearn.neighbors import NearestNeighbors
-
-
-def find_nearest_neighbors(points, k): # CPU is faster for this task
-
-    nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='auto').fit(points)  
-    distances, indices = nbrs.kneighbors(points)
-    indices = indices[:, 1:]
-    return indices
-    
-def find_nearest_neighbors_gpu(points, k): # GPU is slower for this task
-    
-    distances = torch.cdist(points, points)  
-    _, indices = torch.topk(distances, k + 1, dim=1, largest=False)  
-    indices = indices[:, 1:]
-    return indices
-         
-def color_blend(position, xiefangcha, opicty, rgb):
-    # blend weight
-    
-    # blend gaussian
-    
-    # blend
-    print('ok')
-
+from utils.time_utils import get_embedder, Embedder
+'''
 def get_embedder(multires, i=1):
     if i == -1: # no Positional Encoding is performed
         return nn.Identity(), 3
@@ -82,7 +55,7 @@ class Embedder:
 
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
-
+'''
 class MLP(nn.Module): 
     def __init__(self, D=8, W=256, input_ch=10, output_ch=1, multires=10): # potision(3) + rotation(4) + scale(3)
         super(MLP, self).__init__()
@@ -118,7 +91,6 @@ class MLP(nn.Module):
 
         h = input_emb
         for i, l in enumerate(self.dynamic):
-            # h = (h - h.mean(dim=0)) / h.std(dim=0) # Z-score normalize
             h = self.dynamic[i](h)
             if i != self.D - 1:
                 h = F.relu(h) # MARK: detial

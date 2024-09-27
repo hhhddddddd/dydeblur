@@ -90,7 +90,7 @@ def getNerfppNorm(cam_info):
         C2W = np.linalg.inv(W2C) # Computed inverse matrix; 4, 4
         cam_centers.append(C2W[:3, 3:4])
 
-    center, diagonal = get_center_and_diag(cam_centers)
+    center, diagonal = get_center_and_diag(cam_centers) # center: mean_camera_center, diagonal: max distance between mean_camera_center and camera
     radius = diagonal * 1.1
 
     translate = -center
@@ -643,7 +643,7 @@ def readD2RFCameras(path):
     
     imgdir = os.path.join(path, 'images_2') # './data/D2RF/Car/images_2'    
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
-                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera image & right camera image)
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera blur image & right camera blur image)
 
     sh = imageio.imread(imgfiles[0]).shape # 400, 940, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width in poses
@@ -661,11 +661,21 @@ def readD2RFCameras(path):
     bds *= sc
 
     poses = recenter_poses(poses)
+
+    imgdir_sharp = os.path.join(path, 'images') # './data/D2RF/Car/images'    
+    imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera sharp image & right camera sharp image)  
      
     cam_infos = []
     for idx, img_path in enumerate(imgfiles):
         # img = imageio.imread(img_path)[...,:3]/255.  # 400, 940, 3; MARK: load image
-        img = Image.open(img_path)
+        if idx % 2 == 0:
+            img = Image.open(img_path)
+        else: 
+            img_path = imgfiles_sharp[idx]
+            img = Image.open(img_path)
+            img = img.resize((sh[1],sh[0])) # resize sharp
+        
         image_name = os.path.basename(img_path).split(".")[0] # 000000_left
         
         uid =  idx // 2             # colmap_id,    unsureness
@@ -730,12 +740,12 @@ def readDyBluRFCameras(path):
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0]) # 3, 5, 48
     bds = poses_arr[:, -2:].transpose([1, 0]) # 2, 48
    
-    imgdir = os.path.join(path, 'images_512x288') 
+    imgdir = os.path.join(path, 'images_512x288') # blur image path, MARK: train image
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
-                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # blur image path
-    imgdir_inference = os.path.join(path, 'inference_images')
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgdir_inference = os.path.join(path, 'inference_images') # sharp image path, MARK: test image
     imgfiles_inference = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
-                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # sharp image path
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width
@@ -757,10 +767,12 @@ def readDyBluRFCameras(path):
     cam_infos = []
     for idx in range(len(poses)): 
         if idx % 2 == 0:
-            img_path = imgfiles[idx // 2]
+            img_path = imgfiles[idx // 2] # MARK: train image
         else:
-            img_path = imgfiles_inference[idx // 2] # MARK: resolution
-        img = Image.open(img_path)  # 400, 940, 3; MARK: load image
+            img_path = imgfiles_inference[idx // 2] # MARK: test image
+        img = Image.open(img_path) # 288, 512, 3
+        if img.size[0] != sh[1]:
+            img = img.resize((sh[1],sh[0])) # resize sharp
         image_name = os.path.basename(img_path).split(".")[0] # 00000
         
         uid =  idx // 2             # colmap_id,    unsureness

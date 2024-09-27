@@ -43,6 +43,10 @@ def create_window(window_size, channel):
 
 
 def ssim(img1, img2, window_size=11, size_average=True):
+
+    # img1 = torch.clamp(img1, min=0, max=1)
+    # img2 = torch.clamp(img2, min=0, max=1)
+
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 

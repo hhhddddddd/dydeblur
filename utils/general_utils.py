@@ -127,7 +127,7 @@ def strip_symmetric(sym):
     return strip_lowerdiag(sym)
 
 
-def build_rotation(r):
+def build_rotation(r): # rotate quaternion -> rotation matrix
     norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
 
     q = r / norm[:, None]
@@ -152,8 +152,8 @@ def build_rotation(r):
 
 
 def build_scaling_rotation(s, r):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
-    R = build_rotation(r)
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda") # [gs_num, 3, 3]
+    R = build_rotation(r) # rotate quaternion -> rotation matrix
 
     L[:, 0, 0] = s[:, 0]
     L[:, 1, 1] = s[:, 1]

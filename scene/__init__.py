@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from scene.deform_model import DeformModel
 from scene.mlp_model import MLP
+from scene.blur_model import Blur
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -94,9 +95,9 @@ class Scene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"] # what's that? spatial_lr_scale
-
-        for resolution_scale in resolution_scales:  # CameraInfo -> Camera; resize image
+        self.cameras_extent = scene_info.nerf_normalization["radius"] # cameras_extent: the max distance between mean_camera_center and camera 
+        print('cameras_extent =', self.cameras_extent)
+        for resolution_scale in resolution_scales:  # CameraInfo -> Camera; MARK: resize image
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
                                                                             args)

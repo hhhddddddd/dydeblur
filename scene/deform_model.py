@@ -36,7 +36,7 @@ class DeformModel:
 
     def load_weights(self, model_path, operate, time, iteration=-1):
         if iteration == -1:
-            loaded_iter = searchForMaxIteration(os.path.join(model_path, "deform"))
+            loaded_iter = searchForMaxIteration(os.path.join(model_path, operate, time, "deform"))
         else:
             loaded_iter = iteration
         weights_path = os.path.join(model_path, operate, time, "deform/iteration_{}/deform.pth".format(loaded_iter))

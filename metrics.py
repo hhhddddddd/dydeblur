@@ -45,7 +45,7 @@ def evaluate(model_paths):
 
     for scene_dir in model_paths:
         try:
-            print("Scene:", scene_dir)
+            print("Scene:", scene_dir) # output/D_NeRF/trex
             full_dict[scene_dir] = {}
             per_view_dict[scene_dir] = {}
             full_dict_polytopeonly[scene_dir] = {} # useless
@@ -53,19 +53,20 @@ def evaluate(model_paths):
 
             test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test)
 
-            for method in os.listdir(test_dir): # ours_40000
+            for method in os.listdir(test_dir): 
                 if not method.startswith("ours"):
                     continue
-                print("Method:", method)
+                print("Method:", method) # ours_40000
 
                 full_dict[scene_dir][method] = {}
                 per_view_dict[scene_dir][method] = {}
                 full_dict_polytopeonly[scene_dir][method] = {}
                 per_view_dict_polytopeonly[scene_dir][method] = {}
 
-                method_dir = test_dir / method      # PosixPath('output/D_NeRF/trex/test/ours_40000)
-                gt_dir = method_dir / "gt"          # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
-                renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)  MARK: target
+                method_dir = test_dir / method        # PosixPath('output/D_NeRF/trex/test/ours_40000)
+                gt_dir = method_dir / "gt"            # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
+                # renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)  MARK: blend
+                renders_dir = method_dir / "dynamic"  # PosixPath('output/D_NeRF/trex/test/ours_40000/dynamic)  MARK: dynamic
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
 
                 ssims = []
