@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 
+
 class GaussianModel: # when initial, gaussians is already belong to scene
     def __init__(self, sh_degree: int): # contain setup_functions
 
@@ -96,7 +97,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float): # 3d scene gaussians initialization
-        self.spatial_lr_scale = spatial_lr_scale   # Hyperparameter: Adjusts the learning rate scaling for different spatial locations
+        self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()     # torch.Size([100000, 3])
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # torch.Size([100000, 3])
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # torch.Size([100000, 3, 16])
@@ -240,6 +241,15 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
         self.active_sh_degree = self.max_sh_degree
 
+    def fetchPly(self, path): # fetch points
+        plydata = PlyData.read(path)
+        vertices = plydata['vertex']
+        positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+        colors = np.vstack([vertices['red'], vertices['green'],
+                        vertices['blue']]).T / 255.0
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+        return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
@@ -344,7 +354,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda") # flatten gradient
@@ -378,7 +388,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False) # grad is large
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling,
-                                                        dim=1).values <= self.percent_dense * scene_extent) # scale is small, 0.01 * 5
+                                                        dim=1).values <= self.percent_dense * scene_extent) # scale is small, 0.01 * camera_extent
 
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -405,7 +415,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         gs_num['split'] =  str(split)+'->'+str(self.get_xyz.shape[0])
 
         # prune
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        prune_mask = (self.get_opacity < min_opacity).squeeze() # min_opacity == 0.05
         gs_num['opacity_prune'] = str(prune_mask.sum().cpu().item())
         gs_num['radii2D'] = torch.all(self.max_radii2D == 0).cpu().item()
         if max_screen_size:
@@ -422,3 +432,35 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True) # viewspace_point_tensor: x, y
         self.denom[update_filter] += 1
+
+    def densify_from_pcd(self, source_path, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
+        ply_path = os.path.join(source_path, "sparse_/points3D.ply")
+        pcd = self.fetchPly(ply_path)
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()     # torch.Size([100000, 3])
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # torch.Size([100000, 3])
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # torch.Size([100000, 3, 16])
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Re-import the scene point cloud:", fused_point_cloud.shape[0])
+
+        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  # torch.Size([100000])
+        # scales = torch.log(torch.sqrt(dist2 * 1e-7))[..., None].repeat(1, 3)
+        scales =  torch.log(torch.ones_like(torch.from_numpy(np.asarray(pcd.points))) * 1e-4).cuda()
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        new_xyz = fused_point_cloud
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+        new_opacities = opacities
+        new_scaling = scales
+        new_rotation = rots
+        new_dynamic = dynamics
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                   new_rotation, new_dynamic)

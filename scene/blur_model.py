@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from knn_cuda import KNN
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 from utils.time_utils import get_embedder, Embedder
@@ -80,12 +81,35 @@ class Blur(nn.Module): # xyz,
                     for i in range(D - 2)] + [nn.Linear(W, self.output_ch)])
         
         self.blur = blur_net.cuda()
+        self.knn = KNN(k=n_pts, transpose_mode=True)
 
     def find_nearest_neighbors(self, points, k): # CPU is faster for this task
 
         nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(points)  
         distances, indices = nbrs.kneighbors(points) # distances: near -> far
         return distances, indices
+
+    def knn_chunk(self, reference, query, chunk=10000): # B, gs_num, 3
+        
+        fine_references = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
+        for i in range(0, query.shape[1], chunk):
+            indies = torch.tensor([], device="cuda") # B, chunk, k * j_num
+            for j in range(0, reference.shape[1], chunk):
+                _, index = self.knn(reference[:,j:j+chunk,:], query[:,i:i+chunk,:]) # B, chunk, k
+                indies = torch.cat((indies, index + j), dim=-1) # B, chunk, k * j_num; float32
+            fine_references = torch.cat((fine_references, reference.squeeze()[indies.int()]), dim=1) # B, chunk, k * j_num, 3 -> B, gs_num, k * j_num, 3
+
+        distances = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
+        indies = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
+        for i in range(0, query.shape[1]): # gs_num
+            reference = fine_references[:,i,:,:] # B, k * j_num, 3
+            fine_query = query[:,i,:].unsqueeze(0) # B, 1, 3
+            distance, index = self.knn(reference, fine_query) # B, 1, k
+            indies = torch.cat((indies, index), dim=1) # B, gs_num, k
+            distances = torch.cat((distances, distance), dim=1) # B, gs_num, k
+
+        return distances, indies
+
 
     def forward(self, xyz, opacity, d_xyz=None, d_rotation=None, d_scaling=None):
 
@@ -95,7 +119,6 @@ class Blur(nn.Module): # xyz,
             points = xyz # N, 3; N == 609
 
         points = points.to("cpu")
-        # blend select: k_neighbors
         distances, indices = self.find_nearest_neighbors(points, self.n_pts) # N, k
         
         # prepare input: density, distance

@@ -4,3 +4,6 @@
 [submodule "submodules/depth-diff-gaussian-rasterization"]
 	path = submodules/depth-diff-gaussian-rasterization
 	url = https://github.com/ingra14m/depth-diff-gaussian-rasterization
+# [submodule "submodules/KNN_CUDA"]
+# 	path = submodules/KNN_CUDA
+# 	url = https://github.com/unlimblue/KNN_CUDA
