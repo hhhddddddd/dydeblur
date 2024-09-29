@@ -11,6 +11,7 @@
 
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
+# os.environ["export CUDA_LAUNCH_BLOCKING"] = '1'
 import sys
 import time
 import json
@@ -30,17 +31,17 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 def handle_exception(exc_type, exc_value, exc_traceback):
-    if exc_type is not KeyboardInterrupt:
-        print(f"Exception: {exc_value}")  
-        pdbr.post_mortem(exc_traceback)
+    # if exc_type is not KeyboardInterrupt:
+    print(f"Exception: {exc_value}")  
+    pdbr.post_mortem(exc_traceback)
          
 sys.excepthook = handle_exception
 
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    # TENSORBOARD_FOUND = True # MARK: switch tb_writer
-    TENSORBOARD_FOUND = False
+    TENSORBOARD_FOUND = True # MARK: switch tb_writer
+    # TENSORBOARD_FOUND = False
 except ImportError:
     TENSORBOARD_FOUND = False
 
@@ -67,8 +68,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0  # exponential moving average loss
-    best_psnr = 0.0
-    best_iteration = 0
+    best_psnr_test = 0.0
+    best_iteration_test = 0
+    best_psnr_train = 0.0
+    best_iteration_train = 0
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000) # Novelty: learning rate decay function
     loss_texts = []
@@ -208,13 +211,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                                                                  radii[visibility_filter])
 
             # Log and save
-            cur_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+            cur_psnr_test, cur_psnr_train = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
                                        testing_iterations, scene, render, (pipe, background), deform,
                                        dataset.load2gpu_on_the_fly, dataset.is_6dof)
-            if iteration in testing_iterations: # best_psnr only aims to testing_iterations
-                if cur_psnr.item() > best_psnr:
-                    best_psnr = cur_psnr.item()
-                    best_iteration = iteration
+            if iteration in testing_iterations: # best_psnr_test only aims to testing_iterations
+                if cur_psnr_test.item() > best_psnr_test:
+                    best_psnr_test = cur_psnr_test.item()
+                    best_iteration_test = iteration
+                if cur_psnr_train.item() > best_psnr_train:
+                    best_psnr_train = cur_psnr_train.item()
+                    best_iteration_train = iteration
 
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -231,7 +237,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                     gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
                     gs_num['iteration'] = iteration
                     gs_texts.append(gs_num)
+                    print(iteration, gaussians.get_xyz.shape[0])
 
+                if iteration > opt.opacity_reset_interval and gaussians.get_xyz.shape[0] < 1000:
+                    gaussians.densify_from_pcd(dataset.source_path, scene.cameras_extent)
+                    print(iteration, gaussians.get_xyz.shape[0])
+                    
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -254,7 +265,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                 blur_mlp.optimizer.zero_grad()
 
     scene_name = dataset.model_path.split("/")[-1]
-    print("{} Best PSNR = {} in Iteration {}".format(scene_name, best_psnr, best_iteration))
+    print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_test, best_iteration_test, gaussians.get_xyz.shape[0]))
+    print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_train, best_iteration_train, gaussians.get_xyz.shape[0]))
     gs_num_path = os.path.join(dataset.model_path, dataset.operate, starttime[:16],'gs_num.json')
     with open(gs_num_path, "w") as file:
         json.dump(gs_texts, file, indent=4)
@@ -294,6 +306,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     test_psnr = 0.0
+    train_psnr = 0.0
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache() # clearing GPU memory
@@ -358,6 +371,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = psnr(images, gts).mean()
                 if config['name'] == 'test' or len(validation_configs[0]['cameras']) == 0:
                     test_psnr = psnr_test
+                else:
+                    train_psnr = psnr_test
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test)) # MARK: console output
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -369,7 +384,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache() # clearing GPU memory
 
-    return test_psnr
+    return test_psnr, train_psnr
 
 
 if __name__ == "__main__":

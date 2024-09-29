@@ -51,7 +51,8 @@ def evaluate(model_paths):
             full_dict_polytopeonly[scene_dir] = {} # useless
             per_view_dict_polytopeonly[scene_dir] = {} # useless
 
-            test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test)
+            # test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test)
+            test_dir = Path(scene_dir) / "train" # PosixPath('output/D_NeRF/trex/train)
 
             for method in os.listdir(test_dir): 
                 if not method.startswith("ours"):
@@ -65,8 +66,8 @@ def evaluate(model_paths):
 
                 method_dir = test_dir / method        # PosixPath('output/D_NeRF/trex/test/ours_40000)
                 gt_dir = method_dir / "gt"            # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
-                # renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)  MARK: blend
-                renders_dir = method_dir / "dynamic"  # PosixPath('output/D_NeRF/trex/test/ours_40000/dynamic)  MARK: dynamic
+                renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)  MARK: blend
+                # renders_dir = method_dir / "dynamic"  # PosixPath('output/D_NeRF/trex/test/ours_40000/dynamic)  MARK: dynamic
                 renders, gts, image_names = readImages(renders_dir, gt_dir)
 
                 ssims = []
