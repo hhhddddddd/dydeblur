@@ -127,10 +127,10 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 
     return distances, indices
 
-print('start')
-knn = KNN(k=5, transpose_mode=True)
-a = torch.rand(1, 300000, 3).cuda()
-b = torch.rand(1, 1, 3).cuda()
+# print('start')
+# knn = KNN(k=5, transpose_mode=True)
+# a = torch.rand(1, 300000, 3).cuda()
+# b = torch.rand(1, 1, 3).cuda()
 
 # start1 = time.time()
 # distances, indices = knn(a,b)
@@ -144,10 +144,15 @@ b = torch.rand(1, 1, 3).cuda()
 # distances, indices = knn_chunk_change2(a,a)
 # print(time.time() - start1)
 
-points = a.squeeze().to("cpu") # 0.9
-start1 = time.time()
-distances, indices = find_nearest_neighbors(points, 5) # N, k
-print(time.time() - start1)
-print('end')
+# points = a.squeeze().to("cpu") # 0.9
+# start1 = time.time()
+# distances, indices = find_nearest_neighbors(points, 5) # N, k
+# print(time.time() - start1)
+# print('end')
 
-# 30.30
+
+criterion = nn.BCELoss()
+a = torch.rand(10,1)
+loss = criterion(a, a)
+print(loss)
+

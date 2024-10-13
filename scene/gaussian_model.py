@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.general_utils import inverse_sigmoid, gumbel_sigmoid, inverse_gumbel_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -44,6 +44,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._dynamic = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.gumbel_noise = torch.empty(0)
 
         self.optimizer = None
 
@@ -58,8 +59,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.dynamic_activation = torch.sigmoid
         self.inverse_dynamic_activation = inverse_sigmoid
 
-        # self.dynamic_activation = torch.nn.Identity()
-        # self.inverse_dynamic_activation = torch.nn.Identity()
+        # self.dynamic_activation = gumbel_sigmoid
+        # self.inverse_dynamic_activation = inverse_gumbel_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize # strange
 
@@ -87,7 +88,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
     @property
     def get_dynamic(self):
-        return self.dynamic_activation(self._dynamic)
+        ret = self.dynamic_activation(self._dynamic)
+        return ret
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -401,7 +403,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation, new_dynamic)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size): # max_screen_size: size_threshold
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration): # max_screen_size: size_threshold
         grads = self.xyz_gradient_accum / self.denom # [gs_num, 1]
         grads[grads.isnan()] = 0.0 # NaN -> 0.0
 
@@ -433,7 +435,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                                                              keepdim=True) # viewspace_point_tensor: x, y
         self.denom[update_filter] += 1
 
-    def densify_from_pcd(self, source_path, spatial_lr_scale):
+    def densify_from_pcd(self, source_path, spatial_lr_scale): # I: uselsee
         self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
         ply_path = os.path.join(source_path, "sparse_/points3D.ply")
         pcd = self.fetchPly(ply_path)

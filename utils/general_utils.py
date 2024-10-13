@@ -17,8 +17,20 @@ import random
 
 
 def inverse_sigmoid(x):
+    x = torch.clamp(x, 1e-6, 1 - 1e-6)
     return torch.log(x / (1 - x))
 
+def gumbel_sigmoid(input, temperature=1, eps = 1e-10):
+    with torch.no_grad():
+        uniform1 = torch.rand(input.size())
+        uniform2 = torch.rand(input.size())
+        gumbel_noise = -torch.log(torch.log(uniform1 + eps)/torch.log(uniform2 + eps) + eps).cuda()
+    reparam = (input + gumbel_noise)/temperature
+    ret = torch.sigmoid(reparam)
+    return ret, gumbel_noise
+
+def inverse_gumbel_sigmoid(output, gumbel_noise, temperature=1, eps = 1e-10):
+    return torch.log(output / (1 - output)) * temperature - gumbel_noise
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution) # 800, 800
