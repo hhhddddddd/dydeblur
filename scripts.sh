@@ -5,22 +5,22 @@
 # python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children --eval --iterations 40000
 # python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex -o dynamic --eval --is_blender # D_NeRF
 
-# python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o knn --eval --iterations 40000
-# python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o knn --eval --iterations 40000 
-# python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o knn --eval --iterations 40000
-# python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o knn --eval --iterations 40000 
-# python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o knn --eval --iterations 40000
-# python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o knn --eval --iterations 40000
-# python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o knn --eval --iterations 40000 
-# python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o knn --eval --iterations 40000
+python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o dynamic --eval --iterations 40000
+python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o dynamic --eval --iterations 40000 
+python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o dynamic --eval --iterations 40000
+python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o dynamic --eval --iterations 40000 
+python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o dynamic --eval --iterations 40000
+python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o dynamic --eval --iterations 40000
+python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o dynamic --eval --iterations 40000 
+python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o dynamic --eval --iterations 40000
 
 
-python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o test --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o test --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o test --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o test --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o test --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o test --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o dynamic --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o dynamic --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o dynamic --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o dynamic --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o dynamic --eval --iterations 40000
 
 
 '''
@@ -36,10 +36,10 @@ gate: gaussian NaN 3000 iter: dynamic nan, mask_loss nan;               over fit
 mountain: gaussian always unchanged -> zero (3100 iter); ssim is low    grad is xiaoshi                     20 gaussian 
 
 
-basketball:     3000 iter gaussian from 18000 -> 55 (ok)            test ok
+basketball:     3000 iter gaussian from 18000 -> 55 (ok)            test ok 30000
 children:       3000 iter gaussian from 50000 -> 15                 test gaussian stop change
-sailor:         ok 3000 iter gaussian from 30000 -> 1000            test ok
-seesaw:         ok 3000 iter gaussian from 110000 -> 30000
+sailor:         ok 3000 iter gaussian from 30000 -> 1000            test ok 100000
+seesaw:         ok 3000 iter gaussian from 110000 -> 30000          test ok 150000 camera_extent is large so gaussian is rise quickly
 skating:        3000 iter gaussian from 65000 -> 1000
 street:         3000 iter gaussian from 57000 -> 0
 
@@ -53,26 +53,28 @@ street:         3000 iter gaussian from 57000 -> 0
 # python render.py -m output/dydeblur/D_NeRF/trex -o dynamic -t 2024-09-19_21:16 --mode render
 # python render.py -m output/dydeblur/D_NeRF/trex -o dynamic -t 2024-09-19_22:06 --mode render
 
-python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-09-27_08:13 --mode render
-python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-09-26_23:56 --mode render
-python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-09-26_19:36 --mode render
+# python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-09-27_08:13 --mode render
+# python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-09-26_23:56 --mode render
+# python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-09-26_19:36 --mode render
 # python render.py -m output/dydeblur/D2RF/Dock -o new -t 2024-09-26_23:56 --mode render
 # python render.py -m output/dydeblur/D2RF/Dining2 -o new -t 2024-09-26_23:56 --mode render
 
-python render.py -m output/dydeblur/DyBluRF/sailor -o test -t 2024-09-28_23:10 --mode render 
-python render.py -m output/dydeblur/DyBluRF/basketball -o test -t 2024-09-29_11:22 --mode render 
-python render.py -m output/dydeblur/DyBluRF/street -o test -t 2024-09-28_15:15 --mode render 
+# python render.py -m output/dydeblur/DyBluRF/sailor -o test -t 2024-09-28_23:10 --mode render 
+# python render.py -m output/dydeblur/DyBluRF/basketball -o test -t 2024-09-29_11:22 --mode render 
+# python render.py -m output/dydeblur/DyBluRF/sailor -o test -t 2024-09-28_23:10 --mode render 
+# python render.py -m output/dydeblur/DyBluRF/seesaw -o test -t 2024-09-27_20:44 --mode render 
 
 '''test
 '''
 
 # python metrics.py -m output/dydeblur/D_NeRF/trex 
 
-python metrics.py -m output/dydeblur/D2RF/Dining1
-python metrics.py -m output/dydeblur/D2RF/Shop
-python metrics.py -m output/dydeblur/D2RF/Gate
+# python metrics.py -m output/dydeblur/D2RF/Dining1
+# python metrics.py -m output/dydeblur/D2RF/Shop
+# python metrics.py -m output/dydeblur/D2RF/Gate
 
-python metrics.py -m output/dydeblur/DyBluRF/sailor 
-python metrics.py -m output/dydeblur/DyBluRF/basketball 
-python metrics.py -m output/dydeblur/DyBluRF/street 
+# python metrics.py -m output/dydeblur/DyBluRF/sailor 
+# python metrics.py -m output/dydeblur/DyBluRF/basketball 
+# python metrics.py -m output/dydeblur/DyBluRF/street 
+# python metrics.py -m output/dydeblur/DyBluRF/seesaw
 

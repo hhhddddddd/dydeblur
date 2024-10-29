@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-
-from knn_cuda import KNN
+import cv2
+from PIL import Image
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
@@ -127,10 +127,10 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 
     return distances, indices
 
-print('start')
-knn = KNN(k=5, transpose_mode=True)
-a = torch.rand(1, 300000, 3).cuda()
-b = torch.rand(1, 1, 3).cuda()
+# print('start')
+# knn = KNN(k=5, transpose_mode=True)
+# a = torch.rand(1, 300000, 3).cuda()
+# b = torch.rand(1, 1, 3).cuda()
 
 # start1 = time.time()
 # distances, indices = knn(a,b)
@@ -144,10 +144,34 @@ b = torch.rand(1, 1, 3).cuda()
 # distances, indices = knn_chunk_change2(a,a)
 # print(time.time() - start1)
 
-points = a.squeeze().to("cpu") # 0.9
-start1 = time.time()
-distances, indices = find_nearest_neighbors(points, 5) # N, k
-print(time.time() - start1)
+# points = a.squeeze().to("cpu") # 0.9
+# start1 = time.time()
+# distances, indices = find_nearest_neighbors(points, 5) # N, k
+# print(time.time() - start1)
+# print('end')
+
+path = "/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset" # sailor/dense/disp/00000.npy
+# path = "/home/xuankai/code/dydeblur/data/D2RF" # Shop/dpt/000000_left.npy
+scene = sorted(os.listdir(path))
+for i in scene:
+    if i == 'stereo_blur_dataset.zip':
+        continue
+    # depth_path = os.path.join(path, i, 'dpt/000000_left.npy')
+    depth_path = os.path.join(path, i, 'dense/disp/00000.npy')
+    output_path = os.path.join("/home/xuankai/code", i+'.png')
+    depth = np.load(depth_path)
+
+    depth = depth - depth.min()
+    depth = depth / depth.max()
+    depth *= 255
+
+    im = Image.fromarray(depth.astype(np.uint8))
+    im.save(output_path)
+
+# depth=cv2.applyColorMap(cv2.convertScaleAbs(depth,alpha=1),cv2.COLORMAP_JET)
+
+# im = Image.fromarray(depth)
+# im.save("/home/xuankai/code/shop_color.png")
 print('end')
 
-# 30.30
+

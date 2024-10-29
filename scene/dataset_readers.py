@@ -11,6 +11,7 @@
 
 import os
 import sys
+import torch
 from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -26,7 +27,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
-
+from mvs_modules.mvs_estimator import MvsEstimator
 
 class CameraInfo(NamedTuple):
     uid: int            # index, Intrinsics
@@ -42,6 +43,8 @@ class CameraInfo(NamedTuple):
     fid: float          # frame time
     depth: Optional[np.array] = None
 
+    K: np.array = None
+    bounds: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -93,7 +96,7 @@ def getNerfppNorm(cam_info):
     center, diagonal = get_center_and_diag(cam_centers) # center: mean_camera_center, diagonal: max distance between mean_camera_center and camera
     radius = diagonal * 1.1
 
-    translate = -center
+    translate = -center # NOTE "-center"
 
     return {"translate": translate, "radius": radius}
 
@@ -114,7 +117,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         width = intr.width
 
         uid = intr.id                           # Intrinsics 
-        R = np.transpose(qvec2rotmat(extr.qvec))
+        R = np.transpose(qvec2rotmat(extr.qvec))# NOTE
         T = np.array(extr.tvec)
 
         if intr.model == "SIMPLE_PINHOLE":
@@ -236,7 +239,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, frame["file_path"] + extension)
             frame_time = frame['time']
 
-            matrix = np.linalg.inv(np.array(frame["transform_matrix"])) # calculate inverse matrix
+            matrix = np.linalg.inv(np.array(frame["transform_matrix"])) # calculate inverse matrix NOTE
             R = -np.transpose(matrix[:3, :3])
             R[:, 0] = -R[:, 0]
             T = -matrix[:3, 3]
@@ -251,7 +254,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 [1, 1, 1]) if white_background else np.array([0, 0, 0])
 
             norm_data = im_data / 255.0
-            mask = norm_data[..., 3:4]
+            mask = norm_data[..., 3:4] # mask
 
             arr = norm_data[:, :, :3] * norm_data[:, :,
                                                   3:4] + bg * (1 - norm_data[:, :, 3:4]) # change background
@@ -259,7 +262,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 np.array(arr * 255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovx
+            FovY = fovx # NOTE Why? H = W = 800 ?
             FovX = fovy
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -666,6 +669,10 @@ def readD2RFCameras(path):
     imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera sharp image & right camera sharp image)  
      
+    depth_dir = os.path.join(path, 'dpt') # './data/D2RF/Car/dpt'    
+    # depth_dir = os.path.join(path, 'depth') # './data/D2RF/Car/depth'    
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # image depth 
+
     cam_infos = []
     for idx, img_path in enumerate(imgfiles):
         # img = imageio.imread(img_path)[...,:3]/255.  # 400, 940, 3; MARK: load image
@@ -690,7 +697,22 @@ def readD2RFCameras(path):
         FovX = focal2fov(focal, width)
 
         fid = idx // 2 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=np.array(FovY), FovX=np.array(FovX), image=img,
+
+        depth = np.load(depth_files[idx])
+        # depth = depth - depth.min()
+        # depth = depth / depth.max()
+        # depth = 1 - depth # reverse
+        depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # 400, 940
+
+        K = np.array([
+            [focal, 0., width],
+            [0., focal, height],
+            [0., 0., 1.]
+        ], dtype=np.float32)
+        bounds = bds[idx]
+
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth = depth,
                               image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
     return cam_infos
@@ -711,20 +733,50 @@ def readD2RFDataset(path, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
 
-    ply_path = os.path.join(path, "sparse_/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse_/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse_/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+    if not os.path.exists(os.path.join(path, "mvs.ply")):
+        # Generate mvs point cloud
+        mvs_estimator = MvsEstimator("./mvs_modules/configs/config_mvsformer.json")
+        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(train_cam_infos)
+        torch.cuda.empty_cache()
+        # for i, cam in enumerate(train_cam_infos):
+        #     cam.mvs_depth = mvs_depths[i]
+        #     cam.mvs_mask = masks[i]
+
+        positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+        normals = np.zeros_like(positions)
+
+        # random down sample
+        print('Points num: ', len(positions))
+        pc_downsample = 0.1
+        if pc_downsample < 1.0:
+            random_idx = np.random.choice(positions.shape[0], int(positions.shape[0] * pc_downsample), replace=False)
+            positions = positions[random_idx]
+            colors = colors[random_idx]
+            normals = normals[random_idx]
+
+        # save points
+        ply_path = os.path.join(path, "mvs.ply")
+        storePly(ply_path, positions, colors)
+        pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+        print(f"Initial points num: {positions.shape[0]}")
+        del mvs_estimator
+
+    
+    # ply_path = os.path.join(path, "sparse_/0/points3D.ply")
+    # bin_path = os.path.join(path, "sparse_/0/points3D.bin")
+    # txt_path = os.path.join(path, "sparse_/0/points3D.txt")
+    # if not os.path.exists(ply_path):
+    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    #     try:
+    #         xyz, rgb, _ = read_points3D_binary(bin_path)
+    #     except:
+    #         xyz, rgb, _ = read_points3D_text(txt_path)
+    #     storePly(ply_path, xyz, rgb)
+    # try:
+    #     pcd = fetchPly(ply_path)
+    # except:
+    #     pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -746,6 +798,9 @@ def readDyBluRFCameras(path):
     imgdir_inference = os.path.join(path, 'inference_images') # sharp image path, MARK: test image
     imgfiles_inference = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    depth_dir = os.path.join(path, 'disp') # disp
+    # depth_dir = os.path.join(path, 'depth') # depth
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
     
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width
@@ -768,8 +823,14 @@ def readDyBluRFCameras(path):
     for idx in range(len(poses)): 
         if idx % 2 == 0:
             img_path = imgfiles[idx // 2] # MARK: train image
+            depth = np.load(depth_files[idx // 2])
+            # depth = depth - depth.min()
+            # depth = depth / depth.max()
+            # depth = 1 - depth # reverse
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # 288, 512
         else:
             img_path = imgfiles_inference[idx // 2] # MARK: test image
+            depth = None
         img = Image.open(img_path) # 288, 512, 3
         if img.size[0] != sh[1]:
             img = img.resize((sh[1],sh[0])) # resize sharp
@@ -787,14 +848,25 @@ def readDyBluRFCameras(path):
         FovX = focal2fov(focal, width)
 
         fid = idx // 2 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=np.array(FovY), FovX=np.array(FovX), image=img,
+
+        K = np.array([
+            [focal, 0., width],
+            [0., focal, height],
+            [0., 0., 1.]
+        ], dtype=np.float32)
+        bounds = bds[idx] # min: ~1.0, max: ~2.0
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth = depth,
                               image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
-    return cam_infos
+
+    bds_min = bds.min()
+    bds_max = bds.max()
+    return cam_infos, bds_min, bds_max
 
 def readDyBluRFDataset(path, eval = True, llffhold = 2):
 
-    cam_infos_unsorted = readDyBluRFCameras(path)
+    cam_infos_unsorted, bds_min, bds_max = readDyBluRFCameras(path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval: # divide the training set and test set
@@ -808,20 +880,72 @@ def readDyBluRFDataset(path, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
 
-    ply_path = os.path.join(path, "sparse_/points3D.ply")
-    bin_path = os.path.join(path, "sparse_/points3D.bin")
-    txt_path = os.path.join(path, "sparse_/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
+    if not os.path.exists(os.path.join(path, "mvs.ply")):
+        # Generate mvs point cloud
+        mvs_estimator = MvsEstimator("./mvs_modules/configs/config_mvsformer.json")
+        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(train_cam_infos)
+        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(test_cam_infos)
+        torch.cuda.empty_cache()
+        # for i, cam in enumerate(train_cam_infos):
+        #     cam.mvs_depth = mvs_depths[i]
+        #     cam.mvs_mask = masks[i]
+
+        positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+        normals = np.zeros_like(positions)
+
+        # random down sample
+        print('Points num: ', len(positions))
+        pc_downsample = 0.1
+        if pc_downsample < 1.0:
+            random_idx = np.random.choice(positions.shape[0], int(positions.shape[0] * pc_downsample), replace=False)
+            positions = positions[random_idx]
+            colors = colors[random_idx]
+            normals = normals[random_idx]
+
+        # save points
+        ply_path = os.path.join(path, "mvs.ply")
+        storePly(ply_path, positions, colors)
+        pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+        print(f"Initial points num: {positions.shape[0]}")
+        del mvs_estimator
+    else: 
+        ply_path = os.path.join(path, "mvs.ply")
         pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+
+
+    # ply_path = os.path.join(path, "sparse_/points3D.ply")
+    # bin_path = os.path.join(path, "sparse_/points3D.bin")
+    # txt_path = os.path.join(path, "sparse_/points3D.txt")
+    # if not os.path.exists(ply_path):
+    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    #     try:
+    #         xyz, rgb, _ = read_points3D_binary(bin_path)
+    #     except:
+    #         xyz, rgb, _ = read_points3D_text(txt_path)
+    #     storePly(ply_path, xyz, rgb)
+    # try:
+    #     pcd = fetchPly(ply_path)
+    # except:
+    #     pcd = None
+
+    # ply_path = os.path.join(path, "random.ply") # NOTE random point cloud
+    # if not os.path.exists(ply_path): # MARK: random points
+    #     # Since this data set has no colmap data, we start with random points
+    #     num_pts = 30_000
+    #     print(f"Generating random point cloud ({num_pts})...")
+
+    #     # We create random points inside the bounds of the synthetic Blender scenes
+    #     xyz = np.random.random((num_pts, 3)) * (bds_max * 1.1 - bds_min * 0.9) + bds_min * 0.9
+    #     shs = np.random.random((num_pts, 3)) / 255.0
+    #     pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
+    #         shs), normals=np.zeros((num_pts, 3)))
+
+    #     storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    # try:
+    #     pcd = fetchPly(ply_path) # MARK: random.ply
+    # except:
+    #     pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

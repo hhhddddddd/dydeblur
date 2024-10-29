@@ -11,22 +11,35 @@
 
 import torch
 import sys
+import cv2
 from datetime import datetime
 import numpy as np
 import random
 
 
 def inverse_sigmoid(x):
+    x = torch.clamp(x, 1e-6, 1 - 1e-6)
     return torch.log(x / (1 - x))
 
+def gumbel_sigmoid(input, temperature=1, eps = 1e-10):
+    with torch.no_grad():
+        uniform1 = torch.rand(input.size())
+        uniform2 = torch.rand(input.size())
+        gumbel_noise = -torch.log(torch.log(uniform1 + eps)/torch.log(uniform2 + eps) + eps).cuda()
+    reparam = (input + gumbel_noise)/temperature
+    ret = torch.sigmoid(reparam)
+    return ret, gumbel_noise
+
+def inverse_gumbel_sigmoid(output, gumbel_noise, temperature=1, eps = 1e-10):
+    return torch.log(output / (1 - output)) * temperature - gumbel_noise
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution) # 800, 800
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0 # 800, 800, 3
     if len(resized_image.shape) == 3:
-        return resized_image.permute(2, 0, 1)
+        return resized_image.permute(2, 0, 1) # 3, 800, 800
     else:
-        return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        return resized_image.unsqueeze(dim=-1).permute(2, 0, 1) # 1, 800, 800
 
 
 def ArrayToTorch(array, resolution):
@@ -186,3 +199,16 @@ def safe_state(silent): # print function
     np.random.seed(0)
     torch.manual_seed(0)
     torch.cuda.set_device(torch.device("cuda:0"))
+
+def Pseudocolorization(depth):
+    depth = depth - depth.min()
+    depth = depth / depth.max()
+
+    depth *= 255
+
+    # cv2.COLORMAP_JET, blue represents a higher depth value, and red represents a lower depth value
+    # The value of alpha in the cv.convertScaleAbs() function is related to the effective distance in the depth map. If like me, all the depth values
+    # in the default depth map are within the effective distance, and the 16-bit depth has been manually converted to 8-bit depth. , then alpha can be set to 1.
+    depth=cv2.applyColorMap(cv2.convertScaleAbs(depth.cpu().squeeze(0).numpy() ,alpha=1),cv2.COLORMAP_JET)
+
+    return torch.tensor(depth).permute(2, 0, 1)

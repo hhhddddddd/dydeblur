@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 from utils.time_utils import get_embedder, Embedder
+
+
 '''
 def get_embedder(multires, i=1):
     if i == -1: # no Positional Encoding is performed
@@ -56,6 +58,8 @@ class Embedder:
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 '''
+
+
 class MLP(nn.Module): 
     def __init__(self, D=8, W=256, input_ch=10, output_ch=1, multires=10): # potision(3) + rotation(4) + scale(3)
         super(MLP, self).__init__()

@@ -39,7 +39,7 @@ class Camera(nn.Module):
         self.fid = torch.Tensor(np.array([fid])).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
-        self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None
+        self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None # 288, 512
 
         if gt_alpha_mask is not None: # MARK: mask process
             self.original_image *= gt_alpha_mask.to(self.data_device)

@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.general_utils import inverse_sigmoid, gumbel_sigmoid, inverse_gumbel_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -20,7 +20,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
-
+from scene.blur_kernel import GTnet
 
 
 class GaussianModel: # when initial, gaussians is already belong to scene
@@ -44,6 +44,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._dynamic = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.gumbel_noise = torch.empty(0)
 
         self.optimizer = None
 
@@ -58,8 +59,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.dynamic_activation = torch.sigmoid
         self.inverse_dynamic_activation = inverse_sigmoid
 
-        # self.dynamic_activation = torch.nn.Identity()
-        # self.inverse_dynamic_activation = torch.nn.Identity()
+        # self.dynamic_activation = gumbel_sigmoid
+        # self.inverse_dynamic_activation = inverse_gumbel_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize # strange
 
@@ -87,7 +88,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
     @property
     def get_dynamic(self):
-        return self.dynamic_activation(self._dynamic)
+        ret = self.dynamic_activation(self._dynamic)
+        return ret
 
     def get_covariance(self, scaling_modifier=1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
@@ -95,6 +97,9 @@ class GaussianModel: # when initial, gaussians is already belong to scene
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+
+    def create_GTnet(self, hidden=2, width=64, pos_delta=0, num_moments=4):
+        self.GTnet = GTnet(num_hidden=hidden, width=width, pos_delta=pos_delta, num_moments=num_moments)
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float): # 3d scene gaussians initialization
         self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
@@ -137,7 +142,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr * self.spatial_lr_scale, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._dynamic], 'lr': training_args.dynamic_lr, "name": "dynamic"}
+            {'params': [self._dynamic], 'lr': training_args.dynamic_lr, "name": "dynamic"},
+            {'params': self.GTnet.parameters(), 'lr': training_args.gtnet_lr, "name": "GTnet"}
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
@@ -272,6 +278,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
+            if group['name'] == "GTnet":
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None) # get state dictionary
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -308,6 +316,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
+            if group['name'] == "GTnet":
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None) # get state dictionary
@@ -401,7 +411,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation, new_dynamic)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size): # max_screen_size: size_threshold
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration): # max_screen_size: size_threshold
         grads = self.xyz_gradient_accum / self.denom # [gs_num, 1]
         grads[grads.isnan()] = 0.0 # NaN -> 0.0
 
@@ -433,7 +443,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                                                              keepdim=True) # viewspace_point_tensor: x, y
         self.denom[update_filter] += 1
 
-    def densify_from_pcd(self, source_path, spatial_lr_scale):
+    def densify_from_pcd(self, source_path, spatial_lr_scale): # I: uselsee
         self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
         ply_path = os.path.join(source_path, "sparse_/points3D.ply")
         pcd = self.fetchPly(ply_path)

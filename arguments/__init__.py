@@ -100,6 +100,11 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
+
+        self.gtnet_lr = 1e-3
+        self.max_clamp = 1.1
+        self.lambda_s=0.01
+        self.lambda_p=0.01
         super().__init__(parser, "Optimization Parameters")
 
 

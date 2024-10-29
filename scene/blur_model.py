@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from knn_cuda import KNN
+# from knn_cuda import KNN
 from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 from utils.time_utils import get_embedder, Embedder
@@ -62,6 +62,7 @@ class Embedder:
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 '''
+
 class Blur(nn.Module): # xyz, 
     def __init__(self, D=8, W=256, multires=10, n_pts = 5): # potision(3) + rotation(4) + scale(3)
         super(Blur, self).__init__()
@@ -81,7 +82,7 @@ class Blur(nn.Module): # xyz,
                     for i in range(D - 2)] + [nn.Linear(W, self.output_ch)])
         
         self.blur = blur_net.cuda()
-        self.knn = KNN(k=n_pts, transpose_mode=True)
+        # self.knn = KNN(k=n_pts, transpose_mode=True)
 
     def find_nearest_neighbors(self, points, k): # CPU is faster for this task
 

@@ -40,11 +40,11 @@ def loadCam(args, id, cam_info, resolution_scale): # resolution_scale == 1
             global_down = orig_w / args.resolution
 
         scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale)) # 800 800
+        resolution = (int(orig_w / scale), int(orig_h / scale)) # dyblurf: 512 288; d2rf: 
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution) # resize image; 3, 800, 800
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution) # resize image; dyblurf: 3, 288, 512; d2rf: 
 
-    gt_image = resized_image_rgb[:3, ...] # resized image 
+    gt_image = resized_image_rgb[:3, ...] # resized image; dyblurf: 3, 288, 512; d2rf: 
     loaded_mask = None # resized image mask
 
     if resized_image_rgb.shape[0] == 4:

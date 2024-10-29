@@ -10,7 +10,7 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '1' # MARK: GPU
 # os.environ["export CUDA_LAUNCH_BLOCKING"] = '1'
 import sys
 import time
@@ -20,10 +20,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from random import randint
-from utils.loss_utils import l1_loss, ssim, adaptive_binary_crossentropy
+from utils.loss_utils import l1_loss, ssim, local_pearson_loss, pearson_depth_loss
 from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel, DeformModel, MLP, Blur
-from utils.general_utils import safe_state, get_linear_noise_func
+from utils.general_utils import safe_state, get_linear_noise_func, Pseudocolorization
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -52,12 +52,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof) # DeformModel contains DeformNetwork
     deform.train_setting(opt) # Initialize the optimizer and the learning rate scheduler
-    dynamic_mlp = MLP(input_ch=3, output_ch=1)
-    dynamic_mlp.train_setting(opt)
-    blur_mlp = Blur(n_pts=5)
-    blur_mlp.train_setting(opt)
+    # dynamic_mlp = MLP(input_ch=3, output_ch=1)
+    # dynamic_mlp.train_setting(opt)
+    # blur_mlp = Blur(n_pts=5)
+    # blur_mlp.train_setting(opt)
 
     scene = Scene(dataset, gaussians)
+    gaussians.create_GTnet(hidden=3, width=64, pos_delta=0, num_moments=1)
     gaussians.training_setup(opt) # Initialize the optimizer and the learning rate scheduler
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -112,7 +113,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
         fid = viewpoint_cam.fid             # input time
         
-        # opt.warm_up = 500
+        # opt.warm_up = 1000
         if iteration < opt.warm_up:         # warm_up == 3000; maybe for static region
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
         else:
@@ -120,76 +121,86 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
             time_input = fid.unsqueeze(0).expand(N, -1) # Expand the input in the time dimension, eg:torch.Size([10587,1])
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration) # for time_input; why do this?
             d_xyz, d_rotation, d_scaling, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
-           
-            dynamic = dynamic_mlp(d_xyz.detach()) # mlp
-            dynamic = (dynamic - dynamic.mean()) * 2.0 / (dynamic.std() + 1e-12) # Z-Score normalize, scale-factor == 2
-            new_dynamic = 0.4 * gaussians.inverse_dynamic_activation(gaussians.get_dynamic) + 0.6 * dynamic
+
+            # d_xyz = torch.clamp(d_xyz, 0.0, 2.0) * 0.1 # bbox = gaussians.get_xyz.amax(0) - gaussians.get_xyz.amin(0)
+            
+            if tb_writer and iteration % 100 == 0:
+                tb_writer.add_histogram("scene/d_xyz", d_xyz.abs(), iteration)
+                tb_writer.add_histogram("scene/d_rotation", d_rotation.abs(), iteration)
+                tb_writer.add_histogram("scene/d_scaling", d_scaling.abs(), iteration)
+
+            '''
+            # dynamic = dynamic_mlp(d_xyz.detach()) # mlp
+            # dynamic = (dynamic - dynamic.mean()) * 2.0 / (dynamic.std() + 1e-10) # Z-Score normalize, scale-factor == 2
+            # new_dynamic = 0.4 * gaussians.inverse_dynamic_activation(gaussians.get_dynamic) + 0.6 * dynamic
 
             # dynamic = torch.sum(d_xyz.detach().abs(), dim=1) # add
-            # dynamic = (dynamic - dynamic.mean()) * 3.0 / (dynamic.std() + 1e-12) # Z-Score normalize, scale-factor == 3
-            # new_dynamic = 0.4 * gaussians.inverse_dynamic_activation(gaussians.get_dynamic)  + 0.6 * dynamic[..., None]
+            # dynamic = (dynamic - dynamic.mean()) * 3.0 / (dynamic.std() + 1e-10) # Z-Score normalize, scale-factor == 3
+            # new_dynamic = 0.4 * gaussians.inverse_dynamic_activation(gaussians.get_dynamic) + 0.6 * dynamic[..., None]
 
-            optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_dynamic, "dynamic")
-            gaussians._dynamic = optimizable_tensors["dynamic"]
-
-        # static blur process
+            # optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_dynamic, "dynamic")
+            # gaussians._dynamic = optimizable_tensors["dynamic"]
 
 
-        # Static Render
-        render_pkg_re_static = render(viewpoint_cam, gaussians, pipe, background, 0, 0, 0, dataset.is_6dof)                 # static
-        image_static, dynamic_mask_static = render_pkg_re_static["render"], render_pkg_re_static["dynamic"] # 3, 800, 800
+        # if iteration < opt.warm_up:
+        #     render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof) 
+        #     image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
+        #     "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
+        # else:
+        #     render_pkg_re_static = render(viewpoint_cam, gaussians, pipe, background, 0, 0, 0, dataset.is_6dof)                 # static
+        #     image_static, dynamic_mask_static = render_pkg_re_static["render"], render_pkg_re_static["dynamic"] # 3, 800, 800
 
+            
+            # # dynamic blur process
+            # if iteration < opt.warm_up:
+            #     weight, indices = blur_mlp(gaussians.get_xyz.detach(), gaussians.get_opacity.detach()) # N, k
+            # else: 
+            #     weight, indices = blur_mlp(gaussians.get_xyz.detach(), gaussians.get_opacity.detach(), d_xyz.detach(), d_rotation.detach(), d_scaling.detach()) # N, k
 
-        # dynamic blur process
-        if iteration < opt.warm_up:
-            weight, indices = blur_mlp(gaussians.get_xyz.detach(), gaussians.get_opacity.detach()) # N, k
-        else: 
-            weight, indices = blur_mlp(gaussians.get_xyz.detach(), gaussians.get_opacity.detach(), d_xyz.detach(), d_rotation.detach(), d_scaling.detach()) # N, k
+            # features_dc = gaussians._features_dc[indices] # N, 1, 3 -> N, 5, 1, 3
+            # dc_sh = features_dc.shape # N, 5, 1, 3
+            # features_dc = features_dc.view(*dc_sh[:2],-1) # N, 5, 3
 
-        features_dc = gaussians._features_dc[indices] # N, 1, 3 -> N, 5, 1, 3
-        dc_sh = features_dc.shape # N, 5, 1, 3
-        features_dc = features_dc.view(*dc_sh[:2],-1) # N, 5, 3
+            # features_rest = gaussians._features_rest[indices] # N, 15, 3 -> N, 5, 15, 3
+            # rest_sh = features_rest.shape # N, 5, 15, 3
+            # features_rest = features_rest.view(*rest_sh[:2],-1) # N, 5, 45
 
-        features_rest = gaussians._features_rest[indices] # N, 15, 3 -> N, 5, 15, 3
-        rest_sh = features_rest.shape # N, 5, 15, 3
-        features_rest = features_rest.view(*rest_sh[:2],-1) # N, 5, 45
+            # new_features_dc = torch.sum(weight.unsqueeze(-1) * features_dc, dim=1).view(dc_sh[0], *dc_sh[2:]) # N, 1, 3
+            # new_features_rest = torch.sum(weight.unsqueeze(-1) * features_rest, dim=1).view(rest_sh[0], *rest_sh[2:]) # N, 15, 3
 
-        new_features_dc = torch.sum(weight.unsqueeze(-1) * features_dc, dim=1).view(dc_sh[0], *dc_sh[2:]) # N, 1, 3
-        new_features_rest = torch.sum(weight.unsqueeze(-1) * features_rest, dim=1).view(rest_sh[0], *rest_sh[2:]) # N, 15, 3
-
-        optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_features_dc, "f_dc")
-        gaussians._features_dc = optimizable_tensors["f_dc"]
-    
-        optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_features_rest, "f_rest")
-        gaussians._features_rest = optimizable_tensors["f_rest"]
+            # optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_features_dc, "f_dc")
+            # gaussians._features_dc = optimizable_tensors["f_dc"]
         
-        # Dynamic Render
-        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)   # dynamic
-        image_dynamic, viewspace_point_tensor, visibility_filter, radii, dynamic_mask = render_pkg_re["render"], render_pkg_re[
-            "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["dynamic"] # viewspace_points: screenspace_points; visibility_filter: radii > 0 
+            # optimizable_tensors = gaussians.replace_tensor_to_optimizer(new_features_rest, "f_rest")
+            # gaussians._features_rest = optimizable_tensors["f_rest"]
+            
 
-        # dynamic_mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
-        dynamic_mask = torch.clamp(dynamic_mask, 0.0, 1.0)
-        # TODO: assert dynamic_mask whether need torch.clamp
-        image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static                                            # blend
+            # render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)   # dynamic
+            # image_dynamic, viewspace_point_tensor, visibility_filter, radii, dynamic_mask = render_pkg_re["render"], render_pkg_re[
+            # "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["dynamic"] # viewspace_points: screenspace_points; visibility_filter: radii > 0 
+
+            # # dynamic_mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
+            # dynamic_mask = torch.clamp(dynamic_mask, 0.0, 1.0)
+            # image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static                                            # blend
+        '''
+            
+        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=1, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+        image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
+            render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"]
+
+        # depth = depth - depth.min()
+        # depth = depth / depth.max()
+        # depth = (depth - depth.mean()) / (depth.std() + 1e-10)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        # gt_depth = viewpoint_cam.depth.cuda()
         Ll1 = l1_loss(image, gt_image)
-        Ll1_dynamic = l1_loss(image_dynamic, gt_image)
-        # Ll1_static = l1_loss((1 - dynamic_mask.detach()) * image_static , (1 - dynamic_mask.detach()) * gt_image)
+        # depth_Ll1 = l1_loss(depth, -gt_depth)
+        # pearson_loss = pearson_depth_loss(depth.squeeze(0), -gt_depth)
+        # lp_loss = local_pearson_loss(depth.squeeze(0), -gt_depth, box_p = 128, p_corr = 0.5)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  #+ 0.05 * pearson_loss + 0.15 * lp_loss
 
-        criterion = nn.BCEWithLogitsLoss()
-        label = (scene.gaussians.get_dynamic > 0.5).float()
-        mask_loss = criterion(scene.gaussians.get_dynamic, label) # output, label
-
-        # dynamic_01loss = adaptive_binary_crossentropy(scene.gaussians.get_dynamic)
-        loss = (1.0 - opt.lambda_dssim) * (Ll1 + Ll1_dynamic) + opt.lambda_dssim * ((1.0 - ssim(image, gt_image)) + (1.0 - ssim(image_dynamic, gt_image)))  + 0.05 * mask_loss # opt.lambda_dssim == 0.2
-
-        # if iteration % 100 == 0:
-        #     loss_text = {iteration: {'blend_loss': Ll1.cpu(), 'dynamic_loss': Ll1_dynamic.cpu(), 'mask_loss': dynamic_01loss.cpu(), 'total_loss': loss.cpu()}}
-        #     loss_text = {iteration: {'dynamic_loss': Ll1.cpu(), 'total_loss': loss.cpu()}}
-        #     loss_texts.append(loss_text)
         loss.backward() # retain_graph=True
 
         iter_end.record()   # record end time
@@ -226,7 +237,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, starttime, dataset.operate)                                   # save 3d scene (point cloud)
                 deform.save_weights(args.model_path, iteration, starttime, dataset.operate)         # save deformable filed
-                blur_mlp.save_weights(args.model_path, iteration, starttime, dataset.operate)       # save blur filed
+                # blur_mlp.save_weights(args.model_path, iteration, starttime, dataset.operate)       # save blur filed
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -234,7 +245,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None # set size_threshold
-                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, iteration)
                     gs_num['iteration'] = iteration
                     gs_texts.append(gs_num)
                     print(iteration, gaussians.get_xyz.shape[0])
@@ -249,20 +260,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
             # Optimizer step
             if iteration < opt.iterations: # Termination iteration
+                # if iteration >= opt.warm_up:
+                #     dynamic_mlp.optimizer.step()
+                #     dynamic_mlp.update_learning_rate(iteration)
+                #     dynamic_mlp.optimizer.zero_grad()
+                
                 gaussians.optimizer.step()
                 deform.optimizer.step()
-                dynamic_mlp.optimizer.step()
-                blur_mlp.optimizer.step()
+                # blur_mlp.optimizer.step()
                 
                 gaussians.update_learning_rate(iteration)
                 deform.update_learning_rate(iteration)
-                dynamic_mlp.update_learning_rate(iteration)
-                blur_mlp.update_learning_rate(iteration)
+                # blur_mlp.update_learning_rate(iteration)
 
                 gaussians.optimizer.zero_grad(set_to_none=True) # clear gradient, every iteration clear gradient
                 deform.optimizer.zero_grad() # deform also needs to clear gradient
-                dynamic_mlp.optimizer.zero_grad()
-                blur_mlp.optimizer.zero_grad()
+                # blur_mlp.optimizer.zero_grad()
 
     scene_name = dataset.model_path.split("/")[-1]
     print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_test, best_iteration_test, gaussians.get_xyz.shape[0]))
@@ -325,47 +338,65 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     fid = viewpoint.fid
                     xyz = scene.gaussians.get_xyz
                     time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-                    d_xyz, d_rotation, d_scaling, dynamic = deform.step(xyz.detach(), time_input)
+                    d_xyz, d_rotation, d_scaling, _ = deform.step(xyz.detach(), time_input)
 
                     # static render
-                    ret_static = renderFunc(viewpoint, scene.gaussians, *renderArgs, 0, 0, 0, is_6dof)
-                    image_static = torch.clamp(ret_static["render"],0.0, 1.0)
-                    dynamic_mask_static = ret_static["dynamic"]
+                    # ret_static = renderFunc(viewpoint, scene.gaussians, *renderArgs, 0, 0, 0, is_6dof)
+                    # image_static = torch.clamp(ret_static["render"],0.0, 1.0)
+                    # dynamic_mask_static = ret_static["dynamic"]
 
                     # dynamic blur process (useless when test)
 
                     # dynamic render
-                    ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)
-                    image_dynamic = torch.clamp(ret["render"],0.0, 1.0)
-                    dynamic_mask = ret["dynamic"]
+                    # ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)
+                    if config["name"] == 'train':
+                        gt_depth = viewpoint.depth
+                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=1, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        sharp_image = ret["sharp_image"]
+                    else:
+                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                    image = torch.clamp(ret["render"],0.0, 1.0)
+                    depth = ret["depth"]
+                    
+                    depth = depth - depth.min()
+                    depth = depth / depth.max()
 
-                    mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
-                    image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static
+                    # mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
+                    # image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static
                     # image = mask * image_dynamic + (1 - mask) * image_static
 
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    images = torch.cat((images, image_dynamic.unsqueeze(0)), dim=0)
-                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)         
+                    images = torch.cat((images, image.unsqueeze(0)), dim=0) # target image
+                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)    # gt image   
 
                     if load2gpu_on_the_fly:
                         viewpoint.load2device('cpu') # restore: move camera data to the CPU
                     if tb_writer and (idx < 5): # Show only the first 5 images
-                        tb_writer.add_images(config['name'] + "_view_{}/dynamic".format(viewpoint.image_name),
-                                             image_dynamic[None], global_step=iteration)
-                        tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
-                                             dynamic_mask, global_step=iteration, dataformats='HW') 
-                        tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask_static".format(viewpoint.image_name),
-                                             dynamic_mask_static, global_step=iteration, dataformats='HW') 
-                        tb_writer.add_images(config['name'] + "_view_{}/mask".format(viewpoint.image_name),
-                                             mask, global_step=iteration, dataformats='HW') 
-                        tb_writer.add_images(config['name'] + "_view_{}/static".format(viewpoint.image_name),
-                                             image_static[None], global_step=iteration)
-                        tb_writer.add_images(config['name'] + "_view_{}/blend".format(viewpoint.image_name),
-                                             image[None], global_step=iteration) 
+                        # tb_writer.add_images(config['name'] + "_view_{}/dynamic".format(viewpoint.image_name),
+                        #                      image_dynamic[None], global_step=iteration)
+                        # tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
+                        #                      dynamic_mask, global_step=iteration, dataformats='HW') 
+                        # tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask_static".format(viewpoint.image_name),
+                        #                      dynamic_mask_static, global_step=iteration, dataformats='HW') 
+                        # tb_writer.add_images(config['name'] + "_view_{}/mask".format(viewpoint.image_name),
+                        #                      mask, global_step=iteration, dataformats='HW') 
+                        # tb_writer.add_images(config['name'] + "_view_{}/static".format(viewpoint.image_name),
+                        #                      image_static[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
+                                             image[None], global_step=iteration, dataformats='NCHW')
+                        tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name),
+                                             depth, global_step=iteration, dataformats='CHW')
+                        if config["name"] == 'train':
+                            tb_writer.add_images(config['name'] + "_view_{}/sharp".format(viewpoint.image_name),
+                                             sharp_image[None], global_step=iteration)
                        
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
+                            if config["name"] == 'train':
+                                tb_writer.add_images(config['name'] + "_view_{}/gt_depth".format(viewpoint.image_name),
+                                                    gt_depth, global_step=iteration, dataformats='HW')
+
 
                 l1_test = l1_loss(images, gts)
                 psnr_test = psnr(images, gts).mean()
