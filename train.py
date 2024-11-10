@@ -10,7 +10,7 @@
 #
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '1' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
 # os.environ["export CUDA_LAUNCH_BLOCKING"] = '1'
 import sys
 import time
@@ -50,14 +50,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
     starttime = time.strftime("%Y-%m-%d_%H:%M:%S") # train start time
     tb_writer = prepare_output_and_logger(dataset, starttime) # TensorBoard
     gaussians = GaussianModel(dataset.sh_degree)
-    deform = DeformModel(dataset.is_blender, dataset.is_6dof) # DeformModel contains DeformNetwork
+    scene = Scene(dataset, gaussians)
+    deform = DeformModel(dataset.is_blender, dataset.is_6dof, scene.cameras_extent) # DeformModel contains DeformNetwork
     deform.train_setting(opt) # Initialize the optimizer and the learning rate scheduler
     # dynamic_mlp = MLP(input_ch=3, output_ch=1)
     # dynamic_mlp.train_setting(opt)
     # blur_mlp = Blur(n_pts=5)
     # blur_mlp.train_setting(opt)
 
-    scene = Scene(dataset, gaussians)
     gaussians.create_GTnet(hidden=3, width=64, pos_delta=0, num_moments=1)
     gaussians.training_setup(opt) # Initialize the optimizer and the learning rate scheduler
 
@@ -68,16 +68,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
     iter_end = torch.cuda.Event(enable_timing=True)     # record end time
 
     viewpoint_stack = None
+    unseen_viewpoint_stack = None # NOTE
     ema_loss_for_log = 0.0  # exponential moving average loss
     best_psnr_test = 0.0
     best_iteration_test = 0
     best_psnr_train = 0.0
+    best_psnr_virtual = 0.0 # NOTE
     best_iteration_train = 0
-    progress_bar = tqdm(range(opt.iterations), desc="Training progress")
+    progress_bar = tqdm(range(opt.iterations), desc="Train")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000) # Novelty: learning rate decay function
     loss_texts = []
     gs_texts = []
     for iteration in range(1, opt.iterations + 1):
+
+        '''
         if network_gui.conn == None: # I guess visualization? GUI
             network_gui.try_connect()
         while network_gui.conn != None: # I guess visualization? GUI
@@ -93,6 +97,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                     break
             except Exception as e:
                 network_gui.conn = None
+        '''
 
         iter_start.record() # record start time
 
@@ -103,14 +108,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
+        if not unseen_viewpoint_stack: # NOTE 
+            unseen_viewpoint_stack = scene.getVirtualCameras().copy()
 
-        total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
-        time_interval = 1 / total_frame     # time_interval is used for add noise
+        # total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame, before pop
+        # time_interval = 1 / total_frame     # time_interval is used for add noise
 
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))   # len(viewpoint_stack) deincrease
+        if (iteration % 5 == 0) and iteration > opt.warm_up: # NOTE
+            total_frame = len(unseen_viewpoint_stack)  # Monocular Dynamic Scene, current total frame, before pop
+            time_interval = 1 / total_frame     # time_interval is used for add noise
+            viewpoint_cam = unseen_viewpoint_stack.pop(randint(0, len(unseen_viewpoint_stack)-1))
+        else:
+            total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame, before pop
+            # print(total_frame)
+            time_interval = 1 / total_frame     # time_interval is used for add noise
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1)) # len(viewpoint_stack) deincrease
+  
         if dataset.load2gpu_on_the_fly:
             viewpoint_cam.load2device()     # accelerate: move camera data to the GPU
-        total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame
+        # total_frame = len(viewpoint_stack)  # Monocular Dynamic Scene, current total frame, after pop
         fid = viewpoint_cam.fid             # input time
         
         # opt.warm_up = 1000
@@ -184,7 +200,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
             # image = dynamic_mask * image_dynamic + (1 - dynamic_mask) * image_static                                            # blend
         '''
             
-        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=1, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
         image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
             render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"]
 
@@ -194,15 +210,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
-        # gt_depth = viewpoint_cam.depth.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        # depth_Ll1 = l1_loss(depth, -gt_depth)
+        gt_depth = viewpoint_cam.depth.cuda()
+
+        # Ll1 = l1_loss(image, gt_image)
         # pearson_loss = pearson_depth_loss(depth.squeeze(0), -gt_depth)
         # lp_loss = local_pearson_loss(depth.squeeze(0), -gt_depth, box_p = 128, p_corr = 0.5)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))  #+ 0.05 * pearson_loss + 0.15 * lp_loss
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + 0.05 * pearson_loss + 0.15 * lp_loss
+
+        if not viewpoint_cam.is_virtual:
+            Ll1 = l1_loss(image, gt_image)
+            # pearson_loss = pearson_depth_loss(depth.squeeze(0), -gt_depth)
+            # lp_loss = local_pearson_loss(depth.squeeze(0), -gt_depth, box_p = 128, p_corr = 0.5)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) # + 0.05 * pearson_loss + 0.15 * lp_loss
+        else:
+            unseen_v_Ll1 = l1_loss(image, gt_image)
+            # loss = (1.0 - opt.unseen_lambda_dssim) * unseen_v_Ll1 + opt.unseen_lambda_dssim * (1.0 - ssim(image, gt_image))
+            loss = (1.0 - opt.lambda_dssim) * unseen_v_Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         loss.backward() # retain_graph=True
-
         iter_end.record()   # record end time
 
         if dataset.load2gpu_on_the_fly:
@@ -212,7 +237,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log # MARK: ema_loss
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                postfix_info = {
+                    "L": f"{ema_loss_for_log:.{7}f}",
+                    "G": f"{gaussians.get_xyz.shape[0]}",
+                    "S": f"{dataset.source_path.split('/')[-1]}"
+                }
+                progress_bar.set_postfix(postfix_info)
                 progress_bar.update(10)
             if iteration == opt.iterations: # Termination iteration
                 progress_bar.close()
@@ -222,16 +252,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                                                                  radii[visibility_filter])
 
             # Log and save
-            cur_psnr_test, cur_psnr_train = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
+            cur_psnr_test, cur_psnr_train, cur_psnr_virtual = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
                                        testing_iterations, scene, render, (pipe, background), deform,
                                        dataset.load2gpu_on_the_fly, dataset.is_6dof)
             if iteration in testing_iterations: # best_psnr_test only aims to testing_iterations
                 if cur_psnr_test.item() > best_psnr_test:
                     best_psnr_test = cur_psnr_test.item()
                     best_iteration_test = iteration
+                    scene.save(iteration, starttime, dataset.operate, True)                                   # save 3d scene (point cloud)
+                    deform.save_weights(args.model_path, iteration, starttime, dataset.operate, True)         # save deformable filed
                 if cur_psnr_train.item() > best_psnr_train:
                     best_psnr_train = cur_psnr_train.item()
                     best_iteration_train = iteration
+                if cur_psnr_virtual.item() > best_psnr_virtual:
+                    best_psnr_virtual = cur_psnr_virtual.item()
+                    best_iteration_virtual = iteration
 
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -244,15 +279,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None # set size_threshold
+                    size_threshold = 10e9 if iteration > opt.opacity_reset_interval else None # set size_threshold
                     gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, iteration)
                     gs_num['iteration'] = iteration
                     gs_texts.append(gs_num)
-                    print(iteration, gaussians.get_xyz.shape[0])
+                    # print(iteration, gaussians.get_xyz.shape[0])
 
                 if iteration > opt.opacity_reset_interval and gaussians.get_xyz.shape[0] < 1000:
-                    gaussians.densify_from_pcd(dataset.source_path, scene.cameras_extent)
-                    print(iteration, gaussians.get_xyz.shape[0])
+                    gaussians.densify_from_pcd(dataset.source_path)
+                    # print(iteration, gaussians.get_xyz.shape[0])
                     
                 if iteration % opt.opacity_reset_interval == 0 or (
                         dataset.white_background and iteration == opt.densify_from_iter):
@@ -280,12 +315,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations): # lp: d
     scene_name = dataset.model_path.split("/")[-1]
     print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_test, best_iteration_test, gaussians.get_xyz.shape[0]))
     print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_train, best_iteration_train, gaussians.get_xyz.shape[0]))
+    print("{} Best PSNR = {} in Iteration {}, gs_num = {}".format(scene_name, best_psnr_virtual, best_iteration_virtual, gaussians.get_xyz.shape[0]))
+    
     gs_num_path = os.path.join(dataset.model_path, dataset.operate, starttime[:16],'gs_num.json')
     with open(gs_num_path, "w") as file:
         json.dump(gs_texts, file, indent=4)
     loss_texts_path = os.path.join(dataset.model_path, dataset.operate, starttime[:16],'loss.json')
     with open(loss_texts_path, "w") as file:
         json.dump(loss_texts, file, indent=4)
+
+    result = {}
+    result['scene'], result['experiment'] = scene_name, dataset.experiment
+    result['PSNR'], result['Iteration'], result['gs_num'] = best_psnr_test, best_iteration_test, gaussians.get_xyz.shape[0]
+    results_path = os.path.join("/home/xuankai/code/d-3dgs/output/dydeblur/results.json")
+    with open(results_path, 'r+') as file:
+        results = json.load(file)
+        results.append(result)
+        file.seek(0)
+        json.dump(results, file, indent=4)
 
 
 def prepare_output_and_logger(args, starttime): # TensorBoard writer
@@ -305,7 +352,9 @@ def prepare_output_and_logger(args, starttime): # TensorBoard writer
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
+        # tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
+        tb_writer = SummaryWriter(os.path.join("output/dydeblur/tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
+        tb_writer.add_text('d-3dgs', args.experiment)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
@@ -320,13 +369,13 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     test_psnr = 0.0
     train_psnr = 0.0
+    virtual_psnr = 0.0
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache() # clearing GPU memory
-        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
-                              {'name': 'train',
-                               'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in
-                                           range(5, 30, 5)]})
+        validation_configs = ({'name': 'test', 'cameras': scene.getSortedTestCameras()}, # n
+                              {'name': 'train','cameras': scene.getSortedTrainCameras()}, # n
+                              {'name': 'virtual', 'cameras': scene.getSortedVirtualCameras()}) # NOTE 4n
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -349,9 +398,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
                     # dynamic render
                     # ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)
-                    if config["name"] == 'train':
+                    if config["name"] == 'train' or config["name"] == 'virtual': # NOTE
                         gt_depth = viewpoint.depth
-                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=1, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        # Normalization facilitates visualization
+                        gt_depth = gt_depth - gt_depth.min()
+                        gt_depth = gt_depth / gt_depth.max()
+                        gt_depth = 1 - gt_depth # reverse
+
+                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
                         sharp_image = ret["sharp_image"]
                     else:
                         ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
@@ -371,7 +425,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
                     if load2gpu_on_the_fly:
                         viewpoint.load2device('cpu') # restore: move camera data to the CPU
-                    if tb_writer and (idx < 5): # Show only the first 5 images
+                    # if tb_writer and (idx % 6 == 0): # Show only the first 5 images
+                    if tb_writer and (idx % 6 == 0): # Show only the first 5 images
                         # tb_writer.add_images(config['name'] + "_view_{}/dynamic".format(viewpoint.image_name),
                         #                      image_dynamic[None], global_step=iteration)
                         # tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
@@ -386,14 +441,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                                              image[None], global_step=iteration, dataformats='NCHW')
                         tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name),
                                              depth, global_step=iteration, dataformats='CHW')
-                        if config["name"] == 'train':
+                        if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
                             tb_writer.add_images(config['name'] + "_view_{}/sharp".format(viewpoint.image_name),
                                              sharp_image[None], global_step=iteration)
                        
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
-                            if config["name"] == 'train':
+                            if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
                                 tb_writer.add_images(config['name'] + "_view_{}/gt_depth".format(viewpoint.image_name),
                                                     gt_depth, global_step=iteration, dataformats='HW')
 
@@ -402,8 +457,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test = psnr(images, gts).mean()
                 if config['name'] == 'test' or len(validation_configs[0]['cameras']) == 0:
                     test_psnr = psnr_test
-                else:
+                elif config['name'] == 'train':
                     train_psnr = psnr_test
+                else:
+                    virtual_psnr = psnr_test
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test)) # MARK: console output
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
@@ -415,7 +472,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache() # clearing GPU memory
 
-    return test_psnr, train_psnr
+    return test_psnr, train_psnr, virtual_psnr
 
 
 if __name__ == "__main__":
@@ -428,9 +485,9 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=[5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
+                        default=[5000, 6000, 7000] + list(range(7000, 40001, 1000)))
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[40000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000, 3101, 20000, 40000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])          # Namespace
     args.save_iterations.append(args.iterations)    # save the last iteration

@@ -16,14 +16,15 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None):
+    def __init__(self, colmap_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None, depthv2=None, is_virtual=False):
         super(Camera, self).__init__()
 
         self.uid = uid
         self.colmap_id = colmap_id
         self.R = R
         self.T = T
+        self.K = K
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
@@ -40,6 +41,7 @@ class Camera(nn.Module):
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
         self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None # 288, 512
+        self.depthv2 = torch.Tensor(depthv2).to(self.data_device) if depthv2 is not None else None # 288, 512
 
         if gt_alpha_mask is not None: # MARK: mask process
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -53,12 +55,14 @@ class Camera(nn.Module):
         self.scale = scale # camera center scale
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).to(
-            self.data_device) # W2C, 4x4
+            self.data_device) # W2C.transpose(0,1), 4x4
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx,
-                                                     fovY=self.FoVy).transpose(0, 1).to(self.data_device) # ProjectionMatrix
+                                                     fovY=self.FoVy).transpose(0, 1).to(self.data_device) # ProjectionMatrix.transpose(0,1), 4x4
         self.full_proj_transform = (
-            self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0) # World coordinate -> image coordinate 
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
+            self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0) # World coordinate -> image coordinate, 4x4, (batch matrix-matrix)
+        self.camera_center = self.world_view_transform.inverse()[3, :3] # camera center
+
+        self.is_virtual = is_virtual # pseudo view
 
     def reset_extrinsic(self, R, T):
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, self.trans, self.scale)).transpose(0, 1).cuda()

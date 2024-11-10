@@ -3,6 +3,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = '2' # MARK: GPU
 import sys
 import pdbr
 import time
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -127,51 +128,48 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 
     return distances, indices
 
-# print('start')
-# knn = KNN(k=5, transpose_mode=True)
-# a = torch.rand(1, 300000, 3).cuda()
-# b = torch.rand(1, 1, 3).cuda()
+# ######################## point bounds ########################
+# path = "/home/xuankai/code/d-3dgs/data/D2RF/"
+# # path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+# for scene in sorted(os.listdir(path)):
 
-# start1 = time.time()
-# distances, indices = knn(a,b)
-# print(time.time() - start1)
+#     point_path = path + scene + "/sparse_/0/points3D.ply"
+#     # point_path = path + scene + "/dense/sparse_/points3D.ply"
+    
+#     plydata = PlyData.read(point_path)
+#     vertices = plydata['vertex']
+#     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
 
-# start1 = time.time()
-# distances, indices = knn_chunk_mine(a,a)
-# print(time.time() - start1)
+#     print(scene, "pcd_max:", positions.max(0))
+#     print(scene, "pcd_min:", positions.min(0))
+# ######################## point bounds ########################
 
-# start1 = time.time()
-# distances, indices = knn_chunk_change2(a,a)
-# print(time.time() - start1)
+######################## train test camera distance ########################
+# path = "/home/xuankai/code/d-3dgs/data/D2RF/"
+path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+for scene in sorted(os.listdir(path)):
 
-# points = a.squeeze().to("cpu") # 0.9
-# start1 = time.time()
-# distances, indices = find_nearest_neighbors(points, 5) # N, k
-# print(time.time() - start1)
-# print('end')
+    # pose_path = path + scene + "/poses_bounds.npy"
+    pose_path = path + scene + "/dense/poses_bounds.npy"
+    
+    poses_arr = np.load(pose_path)
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]) # 34, 3, 5
 
-path = "/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset" # sailor/dense/disp/00000.npy
-# path = "/home/xuankai/code/dydeblur/data/D2RF" # Shop/dpt/000000_left.npy
-scene = sorted(os.listdir(path))
-for i in scene:
-    if i == 'stereo_blur_dataset.zip':
-        continue
-    # depth_path = os.path.join(path, i, 'dpt/000000_left.npy')
-    depth_path = os.path.join(path, i, 'dense/disp/00000.npy')
-    output_path = os.path.join("/home/xuankai/code", i+'.png')
-    depth = np.load(depth_path)
+    train_poses = []
+    test_poses = []
+    for i in range(len(poses)):
+        if i % 2 == 0:
+            train_pose = poses[i]
+            train_poses.append(train_pose)
+        else: 
+            test_pose = poses[i]
+            test_poses.append(test_pose)
+    train_center = np.stack(train_poses)[:, :, 3] # 17, 3
+    test_center = np.stack(test_poses)[:, :, 3] # 17, 3
+    distance = np.linalg.norm((train_center - test_center),axis=1)
+    distance_mean = distance.mean()
 
-    depth = depth - depth.min()
-    depth = depth / depth.max()
-    depth *= 255
+    print(scene, "distance mean:", distance_mean)
+######################## train test camera distance ########################
 
-    im = Image.fromarray(depth.astype(np.uint8))
-    im.save(output_path)
-
-# depth=cv2.applyColorMap(cv2.convertScaleAbs(depth,alpha=1),cv2.COLORMAP_JET)
-
-# im = Image.fromarray(depth)
-# im.save("/home/xuankai/code/shop_color.png")
 print('end')
-
-

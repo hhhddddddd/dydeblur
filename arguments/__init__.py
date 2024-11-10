@@ -53,6 +53,7 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self._source_path = ""
         self._model_path = ""
         self._operate = ""
+        self._experiment = "Unimportant Experiment"
         self._time = ""
         self._images = "images"
         self._resolution = -1
@@ -82,8 +83,8 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
     def __init__(self, parser):
         self.iterations = 40_000
         self.warm_up = 3_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
+        self.position_lr_init = 0.00016 # 0.00016
+        self.position_lr_final = 0.0000016 # 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.deform_lr_max_steps = 40_000
@@ -93,7 +94,7 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
         self.dynamic_lr = 0.001
-        self.percent_dense = 0.01
+        self.percent_dense = 0.01 # what's this?
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
@@ -105,6 +106,9 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.max_clamp = 1.1
         self.lambda_s=0.01
         self.lambda_p=0.01
+
+        self.unseen_lambda_dssim = 0.8
+        
         super().__init__(parser, "Optimization Parameters")
 
 

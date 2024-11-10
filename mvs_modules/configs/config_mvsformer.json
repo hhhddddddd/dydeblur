@@ -1,8 +1,10 @@
 {
     "model_path": "./pretrained/MVSFormer-Blended/best.pth", 
     "save_vis_path": "./output/",
-    "max_w": 1536,
-    "max_h": 1152,
+    "origin_max_w": 1536,
+    "origin_max_h": 1152,
+    "max_w": 1024,
+    "max_h": 576,
     "tmp": [5.0,5.0,5.0,1.0],
     "prob_threshold": [0.5,0.5,0.5,0.5],
     "thres_disp": 1.0,

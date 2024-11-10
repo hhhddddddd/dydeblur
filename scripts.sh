@@ -5,23 +5,27 @@
 # python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children --eval --iterations 40000
 # python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex -o dynamic --eval --is_blender # D_NeRF
 
-python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o dynamic --eval --iterations 40000
-python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o dynamic --eval --iterations 40000 
-python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o dynamic --eval --iterations 40000
-python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o dynamic --eval --iterations 40000 
-python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o dynamic --eval --iterations 40000
-python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o dynamic --eval --iterations 40000
-python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o dynamic --eval --iterations 40000 
-python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o dynamic --eval --iterations 40000
+python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o new -e sc_change_camera --eval --iterations 40000
+# python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o new --eval --iterations 40000
+# python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o new --eval --iterations 40000
+# python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o new --eval --iterations 40000
+# python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o new --eval --iterations 40000
+python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o new -e only_sc --eval --iterations 40000
+# python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o new --eval --iterations 40000
+python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o new -e sc_change_camera --eval --iterations 40000
 
 
-python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o dynamic --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o dynamic --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o dynamic --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o dynamic --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o dynamic --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o camera --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o camera --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o camera -e virtual_pose_mid --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o new -e only_sc --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o camera --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o camera --eval --iterations 40000
 
+
+# python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e sfm --eval --iterations 40000
+# python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e mvs --eval --iterations 40000
+# python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e random --eval --iterations 40000
 
 '''
 shop: ok                                                                OOM: 90000 gaussian 34246 iter      ok  150000
@@ -55,7 +59,7 @@ street:         3000 iter gaussian from 57000 -> 0
 
 # python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-09-27_08:13 --mode render
 # python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-09-26_23:56 --mode render
-# python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-09-26_19:36 --mode render
+python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-11-07_08:46 --mode render
 # python render.py -m output/dydeblur/D2RF/Dock -o new -t 2024-09-26_23:56 --mode render
 # python render.py -m output/dydeblur/D2RF/Dining2 -o new -t 2024-09-26_23:56 --mode render
 

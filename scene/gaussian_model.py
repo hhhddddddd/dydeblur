@@ -133,8 +133,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # self.denom: self.denominator
 
-        self.spatial_lr_scale = 5
-
+        self.spatial_lr_scale = 5. # FIXME
+        print("Gaussian cameras_extent =", self.spatial_lr_scale)
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -342,7 +342,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_dynamic):
+                              new_rotation, new_dynamic, selected_pts_mask=None, N=1,  add_sfm_point=False):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
@@ -362,10 +362,15 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # clear accumulating gradient
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if add_sfm_point:
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            return
+        if selected_pts_mask is None: selected_pts_mask = torch.tensor([False]).repeat(self.max_radii2D.shape[0]).cuda()
+        self.max_radii2D = torch.cat([self.max_radii2D, (self.max_radii2D[selected_pts_mask].repeat(N))/N], dim=0)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=3):
-        n_init_points = self.get_xyz.shape[0]
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2): # MARK: N=3
+        n_init_points = self.get_xyz.shape[0] # number of point after clone
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda") # flatten gradient
         padded_grad[:grads.shape[0]] = grads.squeeze() # flatten gradient
@@ -376,7 +381,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         # Increase the split Gaussian
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
-        samples = torch.normal(mean=means, std=stds)
+        samples = torch.normal(mean=means, std=stds) # N_point, 3
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1) # rotate quaternion -> rotation matrix
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)) # MARK: clever
@@ -386,7 +391,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
         new_dynamic = self._dynamic[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic, selected_pts_mask, N=N)
 
         # Delete the original Gaussian
         prune_filter = torch.cat(
@@ -409,7 +414,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         new_dynamic = self._dynamic[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_dynamic)
+                                   new_rotation, new_dynamic, selected_pts_mask)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration): # max_screen_size: size_threshold
         grads = self.xyz_gradient_accum / self.denom # [gs_num, 1]
@@ -428,6 +433,9 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         prune_mask = (self.get_opacity < min_opacity).squeeze() # min_opacity == 0.05
         gs_num['opacity_prune'] = str(prune_mask.sum().cpu().item())
         gs_num['radii2D'] = torch.all(self.max_radii2D == 0).cpu().item()
+        print('mean=',self.max_radii2D.mean())
+        print('max=',self.max_radii2D.max())
+        print('min=',self.max_radii2D.min())
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size                  # big points view sapce, strange: self.max_radii2D is always zero?
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent   # big points world space
@@ -443,19 +451,22 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                                                              keepdim=True) # viewspace_point_tensor: x, y
         self.denom[update_filter] += 1
 
-    def densify_from_pcd(self, source_path, spatial_lr_scale): # I: uselsee
-        self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
+    def densify_from_pcd(self, source_path): # I: uselsee
         ply_path = os.path.join(source_path, "sparse_/points3D.ply")
-        pcd = self.fetchPly(ply_path)
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()     # torch.Size([100000, 3])
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())   # torch.Size([100000, 3])
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # torch.Size([100000, 3, 16])
+        try:
+            pcd = self.fetchPly(ply_path)
+        except:
+            ply_path = os.path.join(source_path, "sparse_/0/points3D.ply")
+            pcd = self.fetchPly(ply_path)
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Re-import the scene point cloud:", fused_point_cloud.shape[0])
 
-        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  # torch.Size([100000])
+        # dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         # scales = torch.log(torch.sqrt(dist2 * 1e-7))[..., None].repeat(1, 3)
         scales =  torch.log(torch.ones_like(torch.from_numpy(np.asarray(pcd.points))) * 1e-4).cuda()
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
@@ -473,4 +484,4 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         new_dynamic = dynamics
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_dynamic)
+                                   new_rotation, new_dynamic, add_sfm_point=True)

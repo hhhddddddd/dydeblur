@@ -50,12 +50,12 @@ class MvsEstimator:
             photometric_confidences.append(photometric_confidence)
             cam_mats.append(proj_matrices[:,0,:,:,:])
             all_ori_imgs.append(ori_imgs[0])
-        
+        print("ok")
         # merge MVS depth into point cloud
         points, masks = self.merge_mvs_depths(all_ori_imgs, mvs_depths, photometric_confidences, cam_mats, prob_threshold=self.config['prob_threshold'])
         mvs_depths = [mvs_depths[i].squeeze().cpu().numpy() for i in range(len(mvs_depths))]
 
-        save_path = "/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset/sailor/dense"
+        save_path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/sailor/dense"
         if save_path is not None:
             vis_path = os.path.join(save_path, 'vis')
             os.makedirs(vis_path, exist_ok=True)

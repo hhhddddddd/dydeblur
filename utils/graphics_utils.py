@@ -33,10 +33,10 @@ def geom_transform_points(points, transf_matrix):
 
 def getWorld2View(R, t): # world -> camera
     Rt = np.zeros((4, 4))
-    Rt[:3, :3] = R.transpose() # why transpose?
-    Rt[:3, 3] = t
+    Rt[:3, :3] = R.transpose()  # R in c2w
+    Rt[:3, 3] = t               # T in w2c
     Rt[3, 3] = 1.0
-    return np.float32(Rt)
+    return np.float32(Rt) 
 
 
 def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0): # world -> camera

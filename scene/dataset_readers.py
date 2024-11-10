@@ -22,6 +22,7 @@ import json
 import imageio
 from glob import glob
 import cv2 as cv
+import open3d as o3d
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
@@ -42,6 +43,7 @@ class CameraInfo(NamedTuple):
     height: int
     fid: float          # frame time
     depth: Optional[np.array] = None
+    depthv2: Optional[np.array] = None
 
     K: np.array = None
     bounds: np.array = None
@@ -52,6 +54,7 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
+    sc: float = 1.
 
 
 def load_K_Rt_from_P(filename, P=None):
@@ -75,6 +78,31 @@ def load_K_Rt_from_P(filename, P=None):
     pose[:3, 3] = (t[:3] / t[3])[:, 0]
 
     return K, pose
+
+def farthest_point_sample(xyz, npoint):
+    """
+    Farthest point sampling
+
+    Input:
+        xyz: pointcloud data, [B, N, C], B: batchsize, N: the number of point in one bitchsize, C: the number of characteristic in one point
+        npoint: number of samples
+    Return:
+        centroids: sampled pointcloud index, [B, npoint]
+    """
+    device = xyz.device
+    B, N, C = xyz.shape
+    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device) # 1, 512
+    distance = torch.ones(B, N).to(device).to(torch.float64) * 1e10 # 1, 100000
+    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
+    batch_indices = torch.arange(B, dtype=torch.long).to(device)
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].view(B, 1, C)
+        dist = torch.sum((xyz - centroid) ** 2, -1) # B N
+        mask = dist < distance
+        distance[mask] = dist[mask]
+        farthest = torch.max(distance, -1)[1]
+    return centroids
 
 
 def getNerfppNorm(cam_info):
@@ -148,23 +176,34 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     return cam_infos
 
 
-def fetchPly(path): # fetch points
+def fetchPly(path, sc=1.): # fetch points
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    positions *= sc
     colors = np.vstack([vertices['red'], vertices['green'],
                        vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
+def fetch_slm_Ply(path, sc=1.): # fetch points
+    plydata = PlyData.read(path)
+    vertices = plydata['vertex']
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    positions *= sc
+    colors = np.vstack([vertices['f_dc_0'], vertices['f_dc_1'],
+                   vertices['f_dc_2']]).T / 255.0
+    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
-def storePly(path, xyz, rgb): # store points
+def storePly(path, xyz, rgb, normals=None): # store points
     # Define the dtype for the structured array
-    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+    dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), # f4: np.float32, u1: np.uint8
              ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
              ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
 
-    normals = np.zeros_like(xyz)
+    if normals is None:
+        normals = np.zeros_like(xyz)
 
     elements = np.empty(xyz.shape[0], dtype=dtype)
     attributes = np.concatenate((xyz, normals, rgb), axis=1)
@@ -410,8 +449,8 @@ def readNerfiesCameras(path):
     with open(f'{path}/dataset.json', 'r') as f:    # MARK: dataset.json
         dataset_json = json.load(f)
 
-    coord_scale = scene_json['scale']
-    scene_center = scene_json['center']
+    coord_scale = scene_json['scale'] # 0.04
+    scene_center = scene_json['center'] # 0.7335441453210703, 5.389038591423233, 10.511067242424215
 
     name = path.split('/')[-2]
     if name.startswith('vrig'):
@@ -447,7 +486,7 @@ def readNerfiesCameras(path):
     all_cam_params = []
     for im in all_img:
         camera = camera_nerfies_from_JSON(f'{path}/camera/{im}.json', ratio)
-        camera['position'] = camera['position'] - scene_center
+        camera['position'] = camera['position'] - scene_center # camera['position']: -2.001690149307251, 1.6647430658340454, -1.7718678712844849
         camera['position'] = camera['position'] * coord_scale
         all_cam_params.append(camera)
 
@@ -543,9 +582,9 @@ def readCamerasFromNpy(path, npy_file, split, hold_id, num_images):
         images_names = sorted(os.listdir(video_path))
         n_frames = num_images
 
-        matrix = np.linalg.inv(np.array(c2w)) # strange
-        R = np.transpose(matrix[:3, :3])
-        T = matrix[:3, 3]
+        matrix = np.linalg.inv(np.array(c2w)) # w2c
+        R = np.transpose(matrix[:3, :3]) # R in c2w
+        T = matrix[:3, 3] # T in w2c
 
         for idx, image_name in enumerate(images_names[:num_images]):
             image_path = os.path.join(video_path, image_name)
@@ -618,20 +657,20 @@ def poses_avg(poses):
     
     hwf = poses[0, :3, -1:]
 
-    center = poses[:, :3, 3].mean(0)
-    vec2 = normalize(poses[:, :3, 2].sum(0))
-    up = poses[:, :3, 1].sum(0)
+    center = poses[:, :3, 3].mean(0) # camera center
+    vec2 = normalize(poses[:, :3, 2].sum(0)) # Z-axis
+    up = poses[:, :3, 1].sum(0) # Up-axis
     c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
     return c2w
 
-def recenter_poses(poses):
+def recenter_poses(poses): # poses: 48, 3, 5
 
     poses_ = poses+0
     bottom = np.reshape([0,0,0,1.], [1,4])
-    c2w = poses_avg(poses)
-    c2w = np.concatenate([c2w[:3,:4], bottom], -2)
-    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
-    poses = np.concatenate([poses[:,:3,:4], bottom], -2)
+    c2w = poses_avg(poses) # 3, 5
+    c2w = np.concatenate([c2w[:3,:4], bottom], -2) # 4, 4
+    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1]) # 48, 1, 4
+    poses = np.concatenate([poses[:,:3,:4], bottom], -2) # 48, 4, 4
 
     poses = np.linalg.inv(c2w) @ poses
     poses_[:,:3,:4] = poses[:,:3,:4]
@@ -647,31 +686,47 @@ def readD2RFCameras(path):
     imgdir = os.path.join(path, 'images_2') # './data/D2RF/Car/images_2'    
     imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera blur image & right camera blur image)
+    imgdir_sharp = os.path.join(path, 'images') # './data/D2RF/Car/images'    
+    imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera sharp image & right camera sharp image)  
+    depth_dir = os.path.join(path, 'dpt') # './data/D2RF/Car/dpt'       
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # image depth 
+    depth_fine_dir = os.path.join(path, 'dpt') # depth anything v2
+    depth_fine_files = [os.path.join(depth_fine_dir, f) for f in sorted(os.listdir(depth_fine_dir)) if f.endswith('npy')] # depth map path
 
     sh = imageio.imread(imgfiles[0]).shape # 400, 940, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width in poses
-    poses[2, 4, :] = poses[2, 4, :] * 1./ 2 # image -> image_2
+    poses[2, 4, :] = poses[2, 4, :] * 1./ 2 # change focal, image -> image_2
     
     poses = np.concatenate([poses[:, 1:2, :], 
                             -poses[:, 0:1, :], 
-                            poses[:, 2:, :]], 1) # llff(DRB) -> nerf(RUB)
+                            poses[:, 2:, :]], 1) # llff (DRB) -> nerf (RUB)
+    poses = np.concatenate([poses[:, 0:1, :], 
+                            -poses[:, 1:3, :], 
+                            poses[:, 3:, :]], 1) # nerf (RUB) -> colmap (RDF)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32) # 34, 3, 5
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)     # 34, 2
 
     bd_factor = 0.9
     sc =  1./(np.percentile(bds[:, 0], 5) * bd_factor)
-    poses[:,:3,3] *= sc
+    print('sc =',sc)
+    poses[:,:3,3] *= sc # change camera center
     bds *= sc
 
-    poses = recenter_poses(poses)
+    # poses = recenter_poses(poses) # FIXME Is it necessary?
 
-    imgdir_sharp = os.path.join(path, 'images') # './data/D2RF/Car/images'    
-    imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
-                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera sharp image & right camera sharp image)  
-     
-    depth_dir = os.path.join(path, 'dpt') # './data/D2RF/Car/dpt'    
-    # depth_dir = os.path.join(path, 'depth') # './data/D2RF/Car/depth'    
-    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # image depth 
+    height = poses[0,0,-1]     # height
+    width = poses[0,1,-1]      # width 
+    focal = poses[0,2,-1]      # focal
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    K = np.array([
+        [focal, 0., width],
+        [0., focal, height],
+        [0., 0., 1.]
+    ], dtype=np.float32)
 
     cam_infos = []
     for idx, img_path in enumerate(imgfiles):
@@ -684,42 +739,32 @@ def readD2RFCameras(path):
             img = img.resize((sh[1],sh[0])) # resize sharp
         
         image_name = os.path.basename(img_path).split(".")[0] # 000000_left
-        
-        uid =  idx // 2             # colmap_id,    unsureness
-        R = poses[idx, :, :-2]      # Extrinsics,   unsureness
-        T = poses[idx, :, -2]       # Intrinsics,   unsureness
-        
-        height = poses[idx,0,-1]     # height
-        width = poses[idx,1,-1]      # width 
-        focal = poses[idx,2,-1]      # focal
-                 
-        FovY = focal2fov(focal, height)
-        FovX = focal2fov(focal, width)
-
-        fid = idx // 2 
 
         depth = np.load(depth_files[idx])
-        # depth = depth - depth.min()
-        # depth = depth / depth.max()
-        # depth = 1 - depth # reverse
-        depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # 400, 940
+        depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 400, 940
+        depthv2 = np.load(depth_fine_files[idx])
+        depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
+        
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = idx // 2 
 
-        K = np.array([
-            [focal, 0., width],
-            [0., focal, height],
-            [0., 0., 1.]
-        ], dtype=np.float32)
+        c2w = poses[idx, :3, :4]                
+        bottom = np.reshape([0,0,0,1.], [1,4])
+        c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # c2w, homogeneous coordinates
+        matrix = np.linalg.inv(np.array(c2w))           # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])            # R in c2w
+        T = matrix[:3, 3]                           # T in w2c
+        
         bounds = bds[idx]
 
-
-        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth = depth,
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2,
                               image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
-    return cam_infos
+    return cam_infos, sc
     
 def readD2RFDataset(path, eval = True, llffhold = 2):
 
-    cam_infos_unsorted = readD2RFCameras(path)
+    cam_infos_unsorted, sc = readD2RFCameras(path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval: # divide the training set and test set
@@ -732,57 +777,117 @@ def readD2RFDataset(path, eval = True, llffhold = 2):
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
+ 
+    depth_point = False
+    # depth_point =True
+    if depth_point:
+        ply_path = os.path.join(path, "depth.ply")
+        # if not os.path.exists(ply_path): # NOTE first-frame depth point
+        image_path = sorted(os.listdir(os.path.join(path,"images_2")))[0]
+        depth_path = sorted(os.listdir(os.path.join(path,"dpt")))[0]
+        pose_path = os.path.join(path,"poses_bounds.npy")
 
-    if not os.path.exists(os.path.join(path, "mvs.ply")):
-        # Generate mvs point cloud
-        mvs_estimator = MvsEstimator("./mvs_modules/configs/config_mvsformer.json")
-        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(train_cam_infos)
-        torch.cuda.empty_cache()
-        # for i, cam in enumerate(train_cam_infos):
-        #     cam.mvs_depth = mvs_depths[i]
-        #     cam.mvs_mask = masks[i]
+        image = Image.open(os.path.join(path, "images_2", image_path))
+        image = np.array(image).reshape(-1, 3) # 360, 940, 3 -> 360 * 940, 3
+        depth = np.load(os.path.join(path, "dpt", depth_path)).reshape(-1, 1) # 360 * 940, 1
+        depth = (depth.max() + depth.min()) - depth # inverse depth -> depth
+        pose = np.load(pose_path)[:, :-2].reshape([-1, 3, 5])[0] # 3, 5
 
-        positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-        normals = np.zeros_like(positions)
+        height, width, focal = pose[:, 4] / 2
+        c2w = pose[:3, :4]
+        c2w = np.concatenate([c2w[:, 0:1], -c2w[:, 1:2], -c2w[:, 2:3], c2w[:, 3:4]], 1) # llff (DRB) -> colmap (RDF)
+        xs, ys = np.meshgrid(np.arange(width), np.arange(height)) # 360, 940
+        xs, ys = xs.reshape(-1, 1), ys.reshape(-1, 1) # 360 * 940, 1
 
-        # random down sample
-        print('Points num: ', len(positions))
-        pc_downsample = 0.1
-        if pc_downsample < 1.0:
-            random_idx = np.random.choice(positions.shape[0], int(positions.shape[0] * pc_downsample), replace=False)
-            positions = positions[random_idx]
-            colors = colors[random_idx]
-            normals = normals[random_idx]
+        xs = depth * (xs - (width/2)) / focal
+        ys = depth * (ys - (height/2)) / focal  
+        xyz_cam = np.stack((xs, ys, depth), -1) # 360 * 940, 1, 3
+        xyz_cam = np.squeeze(xyz_cam, axis=1) # 360 * 940, 3
+        xyz_world = xyz_cam.astype(np.float64) @ c2w[:3, :3].T + c2w[:3, 3:4].reshape((1, 3)) # 360 * 940, 3
+        
+        # point cloud alignment manually
+        # xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
+        # xyz_center = (xyz_max + xyz_min) * 0.5
+        # affinemat = np.eye(4) # Affine transformation matrix
+        # affinemat[0, -1], affinemat[1, -1], affinemat[2, -1] = -xyz_center[0], -xyz_center[1], -xyz_min[2] + 1000.
+        # ones = np.ones(xyz_world.shape[0])[:, np.newaxis]
+        # xyz_world = np.concatenate([xyz_world, ones], -1) # Homogeneous coordinates
+        # xyz_world = xyz_world @ affinemat.T
+        # xyz_world = xyz_world[:, :-1] * 0.001 # scale
 
-        # save points
-        ply_path = os.path.join(path, "mvs.ply")
-        storePly(ply_path, positions, colors)
-        pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
-        print(f"Initial points num: {positions.shape[0]}")
-        del mvs_estimator
+        # depth_point remove extrem outliers
+        remove_outliers = True
+        if remove_outliers:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz_world)
+            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.) # larger std_ratio, more point
+            image = image[ind]
+            xyz_world = np.array(pcd.points)
 
-    
-    # ply_path = os.path.join(path, "sparse_/0/points3D.ply")
-    # bin_path = os.path.join(path, "sparse_/0/points3D.bin")
-    # txt_path = os.path.join(path, "sparse_/0/points3D.txt")
-    # if not os.path.exists(ply_path):
-    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-    #     try:
-    #         xyz, rgb, _ = read_points3D_binary(bin_path)
-    #     except:
-    #         xyz, rgb, _ = read_points3D_text(txt_path)
-    #     storePly(ply_path, xyz, rgb)
-    # try:
-    #     pcd = fetchPly(ply_path)
-    # except:
-    #     pcd = None
+        # point cloud alignment sfm
+        ply_sfm_path = os.path.join(path, "sparse_/0/points3D.ply")
+        ply_sfm_data = PlyData.read(ply_sfm_path)
+        vertices = ply_sfm_data['vertex']
+        points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+        # sfm_point remove extrem outliers
+        remove_outliers = True
+        if remove_outliers:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.75)
+            points = np.array(pcd.points)
+
+        pcd_sfm_max, pcd_sfm_min = points.max(0), points.min(0) # points: n_points, 3
+        dist_sfm_max = pcd_sfm_max - pcd_sfm_min
+
+        xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
+        xyz_range = xyz_max - xyz_min
+
+        points = (xyz_world - xyz_min) / xyz_range
+        xyz_world = points * dist_sfm_max * 1.1 + pcd_sfm_min * 1.1
+
+        # Farthest Point Sampling
+        FSP = True
+        if FSP:
+            print('Start Farthest Point Sampling ...')
+            random_idx = farthest_point_sample(torch.tensor(xyz_world[np.newaxis,...]).cuda(), 100_000).squeeze(0).cpu().numpy()
+            print('End Farthest Point Sampling! ')
+            xyz_world = xyz_world[random_idx]
+            image = image[random_idx]
+
+        storePly(ply_path, xyz_world, image)
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+    else:
+        ply_path = os.path.join(path, "sparse_/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse_/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse_/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+
+    pcd_max = pcd.points.max(0)
+    pcd_min = pcd.points.min(0)
+    print('final_pcd_max =', pcd_max)
+    print('final_pcd_min =', pcd_min)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           sc=sc)
     return scene_info
 
 def readDyBluRFCameras(path):
@@ -799,8 +904,9 @@ def readDyBluRFCameras(path):
     imgfiles_inference = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     depth_dir = os.path.join(path, 'disp') # disp
-    # depth_dir = os.path.join(path, 'depth') # depth
     depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
+    depth_fine_dir = os.path.join(path, 'disp') # depth anything v2
+    depth_fine_files = [os.path.join(depth_fine_dir, f) for f in sorted(os.listdir(depth_fine_dir)) if f.endswith('npy')] # depth map path
     
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width
@@ -809,64 +915,72 @@ def readDyBluRFCameras(path):
     poses = np.concatenate([poses[:, 1:2, :], 
                             -poses[:, 0:1, :], 
                             poses[:, 2:, :]], 1)            # llff (DRB) -> nerf (RUB)
+    poses = np.concatenate([poses[:, 0:1, :], 
+                            -poses[:, 1:3, :], 
+                            poses[:, 3:, :]], 1)            # nerf (RUB) -> colmap (RDF)
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)    # 48, 3, 5
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)        # 48, 2
 
+    print("bds:",bds.max(),bds.min())
     bd_factor = 0.9
     sc = 1. if bd_factor is None else 1. / (np.percentile(bds[:, 0], 5) * bd_factor)
-    poses[:, :3, 3] *= sc
-    bds *= sc
+    print('sc =',sc)
+    poses[:, :3, 3] *= sc # change camera center
+    bds *= sc # change point bound
 
-    poses = recenter_poses(poses)
+    # poses = recenter_poses(poses) # FIXME Is it necessary?
+
+    height = poses[0,0,-1]     # height
+    width = poses[0,1,-1]      # width 
+    focal = poses[0,2,-1]      # focal
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    K = np.array([
+        [focal, 0., width],
+        [0., focal, height],
+        [0., 0., 1.]
+    ], dtype=np.float32)
 
     cam_infos = []
     for idx in range(len(poses)): 
         if idx % 2 == 0:
             img_path = imgfiles[idx // 2] # MARK: train image
             depth = np.load(depth_files[idx // 2])
-            # depth = depth - depth.min()
-            # depth = depth / depth.max()
-            # depth = 1 - depth # reverse
-            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # 288, 512
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 288, 512
+            depthv2 = np.load(depth_fine_files[idx // 2])
+            depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
         else:
             img_path = imgfiles_inference[idx // 2] # MARK: test image
             depth = None
+            depthv2 = None
         img = Image.open(img_path) # 288, 512, 3
         if img.size[0] != sh[1]:
             img = img.resize((sh[1],sh[0])) # resize sharp
         image_name = os.path.basename(img_path).split(".")[0] # 00000
         
         uid =  idx // 2             # colmap_id,    unsureness
-        R = poses[idx, :, :-2]      # Extrinsics,   unsureness
-        T = poses[idx, :, -2]       # Intrinsics,   unsureness
-        
-        height = poses[idx,0,-1]     # height
-        width = poses[idx,1,-1]      # width 
-        focal = poses[idx,2,-1]      # focal
-                 
-        FovY = focal2fov(focal, height)
-        FovX = focal2fov(focal, width)
-
         fid = idx // 2 
 
-        K = np.array([
-            [focal, 0., width],
-            [0., focal, height],
-            [0., 0., 1.]
-        ], dtype=np.float32)
+        c2w = poses[idx, :3, :4]                
+        bottom = np.reshape([0,0,0,1.], [1,4])
+        c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # c2w, homogeneous coordinates
+        matrix = np.linalg.inv(np.array(c2w))           # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])            # R in c2w, np.transpose(matrix[:3, :3]) == c2w[:3, :3]
+        T = matrix[:3, 3]                           # T in w2c
+        
         bounds = bds[idx] # min: ~1.0, max: ~2.0
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth = depth,
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2,
                               image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
 
-    bds_min = bds.min()
-    bds_max = bds.max()
-    return cam_infos, bds_min, bds_max
+    return cam_infos, sc
 
 def readDyBluRFDataset(path, eval = True, llffhold = 2):
 
-    cam_infos_unsorted, bds_min, bds_max = readDyBluRFCameras(path)
+    cam_infos_unsorted, sc = readDyBluRFCameras(path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval: # divide the training set and test set
@@ -880,78 +994,142 @@ def readDyBluRFDataset(path, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
 
-    if not os.path.exists(os.path.join(path, "mvs.ply")):
-        # Generate mvs point cloud
-        mvs_estimator = MvsEstimator("./mvs_modules/configs/config_mvsformer.json")
-        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(train_cam_infos)
-        vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(test_cam_infos)
-        torch.cuda.empty_cache()
-        # for i, cam in enumerate(train_cam_infos):
-        #     cam.mvs_depth = mvs_depths[i]
-        #     cam.mvs_mask = masks[i]
-
-        positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-        normals = np.zeros_like(positions)
-
-        # random down sample
-        print('Points num: ', len(positions))
-        pc_downsample = 0.1
-        if pc_downsample < 1.0:
-            random_idx = np.random.choice(positions.shape[0], int(positions.shape[0] * pc_downsample), replace=False)
-            positions = positions[random_idx]
-            colors = colors[random_idx]
-            normals = normals[random_idx]
-
-        # save points
-        ply_path = os.path.join(path, "mvs.ply")
-        storePly(ply_path, positions, colors)
-        pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
-        print(f"Initial points num: {positions.shape[0]}")
-        del mvs_estimator
-    else: 
-        ply_path = os.path.join(path, "mvs.ply")
+    ply_path = os.path.join(path, "sparse_/points3D.ply") # NOTE colmap point cloud
+    bin_path = os.path.join(path, "sparse_/points3D.bin")
+    txt_path = os.path.join(path, "sparse_/points3D.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    try:
         pcd = fetchPly(ply_path)
+    except:
+        pcd = None
 
+    '''
+    # if not os.path.exists(os.path.join(path, "mvs.ply")): # NOTE MVS point cloud
+    #     # Generate mvs point cloud
+    #     mvs_estimator = MvsEstimator("./mvs_modules/configs/config_mvsformer.json")
+    #     vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(train_cam_infos)
+    #     # vertices, mvs_depths, masks = mvs_estimator.get_mvs_pts(test_cam_infos)
+    #     torch.cuda.empty_cache()
+    #     # for i, cam in enumerate(train_cam_infos):
+    #     #     cam.mvs_depth = mvs_depths[i]
+    #     #     cam.mvs_mask = masks[i]
 
-    # ply_path = os.path.join(path, "sparse_/points3D.ply")
-    # bin_path = os.path.join(path, "sparse_/points3D.bin")
-    # txt_path = os.path.join(path, "sparse_/points3D.txt")
-    # if not os.path.exists(ply_path):
-    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-    #     try:
-    #         xyz, rgb, _ = read_points3D_binary(bin_path)
-    #     except:
-    #         xyz, rgb, _ = read_points3D_text(txt_path)
-    #     storePly(ply_path, xyz, rgb)
-    # try:
+    #     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    #     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    #     normals = np.zeros_like(positions)
+
+    #     # random down sample
+    #     print('Points num: ', len(positions))
+    #     pc_downsample = 0.1
+    #     if pc_downsample < 1.0:
+    #         random_idx = np.random.choice(positions.shape[0], int(positions.shape[0] * pc_downsample), replace=False)
+    #         positions = positions[random_idx]
+    #         colors = colors[random_idx]
+    #         normals = normals[random_idx]
+
+    #     # save points
+    #     ply_path = os.path.join(path, "mvs.ply")
+    #     storePly(ply_path, positions, colors)
+    #     pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
+    #     print(f"Initial points num: {positions.shape[0]}")
+    #     del mvs_estimator
+    # else: 
+    #     ply_path = os.path.join(path, "mvs.ply")
     #     pcd = fetchPly(ply_path)
-    # except:
-    #     pcd = None
 
     # ply_path = os.path.join(path, "random.ply") # NOTE random point cloud
-    # if not os.path.exists(ply_path): # MARK: random points
-    #     # Since this data set has no colmap data, we start with random points
-    #     num_pts = 30_000
+    # if not os.path.exists(ply_path):
+    #     num_pts = 100_000
     #     print(f"Generating random point cloud ({num_pts})...")
 
-    #     # We create random points inside the bounds of the synthetic Blender scenes
-    #     xyz = np.random.random((num_pts, 3)) * (bds_max * 1.1 - bds_min * 0.9) + bds_min * 0.9
+    #     ply_sfm_path = os.path.join(path, "sparse_/points3D.ply")
+    #     ply_sfm_data = PlyData.read(ply_sfm_path)
+    #     vertices = ply_sfm_data['vertex']
+    #     points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+    #     pcd_max = points.max(0) # points: n_points, 3
+    #     pcd_min = points.min(0)
+    #     dist_max = pcd_max - pcd_min
+    #     print('sfm_pcd_max =', pcd_max)
+    #     print('sfm_pcd_min =', pcd_min)
+    #     print('sfm_pcd_dist =', dist_max)
+
+    #     xyz = np.random.random((num_pts, 3)) * dist_max * 1.1 + pcd_min * 1.1      
     #     shs = np.random.random((num_pts, 3)) / 255.0
     #     pcd = BasicPointCloud(points=xyz, colors=SH2RGB(
     #         shs), normals=np.zeros((num_pts, 3)))
 
     #     storePly(ply_path, xyz, SH2RGB(shs) * 255)
     # try:
-    #     pcd = fetchPly(ply_path) # MARK: random.ply
+    #     pcd = fetchPly(ply_path)
     # except:
     #     pcd = None
+    
+    
+    # ply_path = os.path.join(path, "lsm.ply") # NOTE lsm point cloud
+    # if not os.path.exists(ply_path):
+    #     ply_sfm_path = os.path.join(path, "sparse_/points3D.ply")
+    #     ply_sfm_data = PlyData.read(ply_sfm_path)
+    #     vertices = ply_sfm_data['vertex']
+    #     points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+    #     pcd_sfm_max = points.max(0) # points: n_points, 3
+    #     pcd_sfm_min = points.min(0)
+    #     dist_sfm_max = pcd_sfm_max - pcd_sfm_min
+    #     print('sfm_pcd_max =', pcd_sfm_max)
+    #     print('sfm_pcd_min =', pcd_sfm_min)
+    #     print('sfm_pcd_dist =', dist_sfm_max)
+    
+    #     ply_lsm_path = os.path.join(path, "lsm_raw.ply")
+    #     ply_lsm_data = PlyData.read(ply_lsm_path)
+    #     vertices = ply_lsm_data['vertex']
+    #     points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+    #     pcd_lsm_max = points.max(0) # points: n_points, 3
+    #     pcd_lsm_min = points.min(0)
+    #     dist_lsm_max = pcd_lsm_max - pcd_lsm_min
+    #     print('lsm_pcd_max =', pcd_lsm_max)
+    #     print('lsm_pcd_min =', pcd_lsm_min)
+    #     print('lsm_pcd_dist =', dist_lsm_max)
+
+    #     points = (points - pcd_lsm_min) / dist_lsm_max
+    #     xyz = points * dist_sfm_max * 1.1 + pcd_sfm_min * 1.1 # xyz: n_points, 3
+    #     colors = np.vstack([vertices['f_dc_0'], vertices['f_dc_1'],
+    #                    vertices['f_dc_2']]).T / 255.0
+    #     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+
+    #     # NOTE Farthest Point Sampling
+    #     random_idx = farthest_point_sample(torch.tensor(xyz[np.newaxis,...]).cuda(), 100_000).squeeze(0).cpu().numpy()
+    #     xyz = xyz[random_idx]
+    #     colors = colors[random_idx]
+    #     normals = normals[random_idx]
+
+    #     pcd = BasicPointCloud(points=xyz, colors=colors, normals=normals)
+        
+    #     storePly(ply_path, xyz, colors * 255, normals)
+    # try:
+    #     pcd = fetchPly(ply_path)
+    # except:
+    #     pcd = None
+    '''
+    
+    pcd_max = pcd.points.max(0)
+    pcd_min = pcd.points.min(0)
+    print('final_pcd_max =', pcd_max)
+    print('final_pcd_min =', pcd_min)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           sc=sc)
     return scene_info
 
 

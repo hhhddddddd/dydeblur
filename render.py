@@ -58,31 +58,32 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
         d_xyz, d_rotation, d_scaling, _ = deform.step(xyz.detach(), time_input)
 
         # static render
-        results_static = render(view, gaussians, pipeline, background, 0, 0, 0, is_6dof)
-        image_static, dynamic_mask_static = results_static["render"], results_static["dynamic"]  # static
+        # results_static = render(view, gaussians, pipeline, background, 0, 0, 0, is_6dof)
+        # image_static, dynamic_mask_static = results_static["render"], results_static["dynamic"]  # static
         
         # dynamic render
-        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof)
-        image_dynamic, dynamic_mask = results["render"], results["dynamic"] # dynamic
+        # results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof)
+        results = render(view, gaussians, pipeline, background, d_xyz, d_rotation, d_scaling, is_6dof, train=0)
+        image_dynamic = results["render"]
 
-        mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
+        # mask, _ = torch.max(torch.stack((dynamic_mask_static, dynamic_mask)), dim=0) # Combine static and dynamic 
         # rendering = image_dynamic * mask + image_static * (1 - mask) # blend
-        rendering = image_dynamic * dynamic_mask + image_static * (1 - dynamic_mask) # blend
+        # rendering = image_dynamic * dynamic_mask + image_static * (1 - dynamic_mask) # blend
         
         depth = results["depth"]
         depth = depth / (depth.max() + 1e-5) # normalization
 
         gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
 
-        torchvision.utils.save_image(image_static, os.path.join(static_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(image_static, os.path.join(static_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(image_dynamic, os.path.join(dynamic_path, '{0:05d}'.format(idx) + ".png"))
 
-        torchvision.utils.save_image(dynamic_mask, os.path.join(dynamic_mask_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(dynamic_mask_static, os.path.join(dynamic_mask_static_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(mask, os.path.join(dynamic_mask_blend_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(dynamic_mask, os.path.join(dynamic_mask_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(dynamic_mask_static, os.path.join(dynamic_mask_static_path, '{0:05d}'.format(idx) + ".png"))
+        # torchvision.utils.save_image(mask, os.path.join(dynamic_mask_blend_path, '{0:05d}'.format(idx) + ".png"))
 
 def interpolate_time(model_path, load2gpt_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, deform):
     render_path = os.path.join(model_path, name, "interpolate_{}".format(iteration), "renders")

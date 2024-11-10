@@ -36,7 +36,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     
     Background tensor (bg_color) must be on GPU!
     """
-
+    deformable_scale = 1.0
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0 # [gs_num, 3]; dtype == torch.float32
     try:
@@ -54,7 +54,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
         tanfovx=tanfovx,
         tanfovy=tanfovy,
         bg=bg_color,
-        scale_modifier=scaling_modifier,
+        scale_modifier=scaling_modifier, # defalut: 1.
         viewmatrix=viewpoint_camera.world_view_transform,
         projmatrix=viewpoint_camera.full_proj_transform, # MARK: projection matrix
         sh_degree=pc.active_sh_degree,
@@ -72,7 +72,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
             means3D = from_homogenous(
                 torch.bmm(d_xyz, to_homogenous(pc.get_xyz).unsqueeze(-1)).squeeze(-1))
     else:
-        means3D = pc.get_xyz + d_xyz
+        means3D = pc.get_xyz + d_xyz * deformable_scale # deformable_scale
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -84,7 +84,7 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier) # the only use of get_covariance
     else:
-        scales = pc.get_scaling + d_scaling
+        scales = pc.get_scaling + d_scaling * deformable_scale # deformable_scale
         rotations = pc.get_rotation + d_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
@@ -118,7 +118,8 @@ def render(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor, d_
         "viewspace_points": screenspace_points,
         "visibility_filter" : radii > 0,
         "radii": radii,
-        "depth": depth}
+        "depth": depth,
+        "sharp_image": rendered_image}
 
     else: # training time
         with torch.no_grad():
