@@ -54,6 +54,13 @@ class Embedder:
     def embed(self, inputs):
         return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
 
+def init_linear_weights(m):
+    if isinstance(m, nn.Linear):
+        if m.weight.shape[0] in [2, 3]:
+            nn.init.xavier_normal_(m.weight, 0.1)
+        else:
+            nn.init.xavier_normal_(m.weight)
+        nn.init.constant_(m.bias, 0)
 
 class DeformNetwork(nn.Module): # DeformNetwork inherit from nn.Module
     def __init__(self, D=8, W=256, input_ch=3, output_ch=59, multires=10, is_blender=False, is_6dof=False):
@@ -101,6 +108,25 @@ class DeformNetwork(nn.Module): # DeformNetwork inherit from nn.Module
         self.gaussian_rotation = nn.Linear(W, 4)    # output d_r function
         self.gaussian_scaling = nn.Linear(W, 3)     # output d_s function
         self.gaussian_dynamic = nn.Linear(W, 1)  
+
+        init = False
+        # init = True
+        if init:
+            if is_blender:
+                self.timenet.apply(init_linear_weights)
+                self.linear.apply(init_linear_weights)
+            else:
+                self.linear.apply(init_linear_weights)
+
+            if is_6dof:
+                self.branch_w.apply(init_linear_weights)
+                self.branch_v.apply(init_linear_weights)
+            else:
+                self.gaussian_warp.apply(init_linear_weights)
+
+            self.gaussian_rotation.apply(init_linear_weights)
+            self.gaussian_scaling.apply(init_linear_weights)
+            self.gaussian_dynamic.apply(init_linear_weights)
 
     def forward(self, x, t):
         t_emb = self.embed_time_fn(t)           # time positional encoding

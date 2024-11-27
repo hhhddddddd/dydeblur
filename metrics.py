@@ -11,6 +11,7 @@
 
 from pathlib import Path
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
 from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
@@ -18,6 +19,7 @@ from utils.loss_utils import ssim
 # from lpipsPyTorch import lpips
 import lpips
 import json
+import models
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
@@ -36,7 +38,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths):
+def evaluate(model_paths, model, use_model=True):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -44,60 +46,64 @@ def evaluate(model_paths):
     print("")
 
     for scene_dir in model_paths:
-        try:
-            print("Scene:", scene_dir) # output/D_NeRF/trex
-            full_dict[scene_dir] = {}
-            per_view_dict[scene_dir] = {}
-            full_dict_polytopeonly[scene_dir] = {} # useless
-            per_view_dict_polytopeonly[scene_dir] = {} # useless
+        # try:
+        print("Scene:", scene_dir) # output/D_NeRF/trex
+        full_dict[scene_dir] = {}
+        per_view_dict[scene_dir] = {}
+        full_dict_polytopeonly[scene_dir] = {} # useless
+        per_view_dict_polytopeonly[scene_dir] = {} # useless
 
-            test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test) MARK: train / test
-            # test_dir = Path(scene_dir) / "train" # PosixPath('output/D_NeRF/trex/train)
+        test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test) MARK: train / test
+        # test_dir = Path(scene_dir) / "train" # PosixPath('output/D_NeRF/trex/train)
 
-            for method in os.listdir(test_dir): 
-                if not method.startswith("ours"):
-                    continue
-                print("Method:", method) # ours_40000
+        for method in os.listdir(test_dir): 
+            if not method.startswith("ours"):
+                continue
+            print("Method:", method) # ours_40000
 
-                full_dict[scene_dir][method] = {}
-                per_view_dict[scene_dir][method] = {}
-                full_dict_polytopeonly[scene_dir][method] = {}
-                per_view_dict_polytopeonly[scene_dir][method] = {}
+            full_dict[scene_dir][method] = {}
+            per_view_dict[scene_dir][method] = {}
+            full_dict_polytopeonly[scene_dir][method] = {}
+            per_view_dict_polytopeonly[scene_dir][method] = {}
 
-                method_dir = test_dir / method        # PosixPath('output/D_NeRF/trex/test/ours_40000)
-                gt_dir = method_dir / "gt"            # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
-                # renders_dir = method_dir / "blend"  # PosixPath('output/D_NeRF/trex/test/ours_40000/blend)
-                renders_dir = method_dir / "dynamic"  # PosixPath('output/D_NeRF/trex/test/ours_40000/dynamic)  MARK: blend / dynamic
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+            method_dir = test_dir / method        # PosixPath('output/D_NeRF/trex/test/ours_40000)
+            gt_dir = method_dir / "gt"            # PosixPath('output/D_NeRF/trex/test/ours_40000/gt)     MARK: gt
+            renders_dir = method_dir / "render"  # PosixPath('output/D_NeRF/trex/test/ours_40000/dynamic)  MARK: blend / dynamic
+            renders, gts, image_names = readImages(renders_dir, gt_dir) # image_num, 1, 3, 400, 940
 
-                ssims = []
-                psnrs = []
-                lpipss = []
+            ssims = []
+            psnrs = []
+            lpipss = []
 
-                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
+            for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                ssims.append(ssim(renders[idx], gts[idx]))
+                psnrs.append(psnr(renders[idx], gts[idx]))
+                if use_model:
+                    with torch.no_grad():
+                        lpips_value = model.forward(gts[idx], renders[idx])
+                        lpipss.append(lpips_value.item())
+                else:
                     lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
 
-                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
-                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
-                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
-                print("")
+            print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
+            print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
+            print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+            print("")
 
-                full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
-                                                     "PSNR": torch.tensor(psnrs).mean().item(),
-                                                     "LPIPS": torch.tensor(lpipss).mean().item()})
-                per_view_dict[scene_dir][method].update(
-                    {"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                     "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                     "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
+            full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
+                                                    "PSNR": torch.tensor(psnrs).mean().item(),
+                                                    "LPIPS": torch.tensor(lpipss).mean().item()})
+            per_view_dict[scene_dir][method].update(
+                {"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+                    "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+                    "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)}})
 
-            with open(scene_dir + "/results.json", 'w') as fp:
-                json.dump(full_dict[scene_dir], fp, indent=True)        # MARK: output
-            with open(scene_dir + "/per_view.json", 'w') as fp:
-                json.dump(per_view_dict[scene_dir], fp, indent=True)    # MARK: output
-        except:
-            print("Unable to compute metrics for model", scene_dir)
+        with open(scene_dir + "/results.json", 'w') as fp:
+            json.dump(full_dict[scene_dir], fp, indent=True)        # MARK: output
+        with open(scene_dir + "/per_view.json", 'w') as fp:
+            json.dump(per_view_dict[scene_dir], fp, indent=True)    # MARK: output
+        # except:
+        #     print("Unable to compute metrics for model", scene_dir)
 
 
 if __name__ == "__main__":
@@ -109,4 +115,7 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
     args = parser.parse_args()
-    evaluate(args.model_paths)
+
+    with torch.no_grad():
+        model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1)
+    evaluate(args.model_paths, model, use_model=True)

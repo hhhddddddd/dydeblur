@@ -1,166 +1,111 @@
-import os
-import torch
+# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Field for compound nerf model, adds scene contraction and image embeddings to instant ngp
+"""
+
 import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
-# from knn_cuda import KNN
+import os
+# from typing import Dict, Literal, Optional, Tuple
+
+import torch
+from torch import nn
 from utils.system_utils import searchForMaxIteration
-from utils.general_utils import get_expon_lr_func
-from utils.time_utils import get_embedder, Embedder
 
-# K-nearest neighbor
-import time
-from sklearn.neighbors import NearestNeighbors
+class Blur(nn.Module):
+    def __init__(self, num_img, H=400, W=600, img_embed=32, ks=17, not_use_rgbd=False,not_use_pe=False):
+        super().__init__()
+        self.num_img = num_img
+        self.W, self.H = W, H
 
-'''
-def get_embedder(multires, i=1):
-    if i == -1: # no Positional Encoding is performed
-        return nn.Identity(), 3
+        self.img_embed_cnl = img_embed
 
-    embed_kwargs = {
-        'include_input': True,
-        'input_dims': i,
-        'max_freq_log2': multires - 1,
-        'num_freqs': multires,
-        'log_sampling': True,
-        'periodic_fns': [torch.sin, torch.cos],
-    }
+        self.min_freq, self.max_freq, self.num_frequencies = 0.0, 3.0, 4
 
-    embedder_obj = Embedder(**embed_kwargs)
-    embed = lambda x, eo=embedder_obj: eo.embed(x)
-    return embed, embedder_obj.out_dim
+        self.embedding_camera = nn.Embedding(self.num_img, self.img_embed_cnl) # learnable function
 
-class Embedder:
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.create_embedding_fn()
+        print('this is single res kernel', ks)
+        
+        self.not_use_rgbd = not_use_rgbd
+        self.not_use_pe = not_use_pe
+        print('single res: not_use_rgbd', self.not_use_rgbd, 'not_use_pe', self.not_use_pe)
+        rgd_dim = 0 if self.not_use_rgbd else 32
+        pe_dim = 0 if self.not_use_pe else 16
 
-    def create_embedding_fn(self):
-        embed_fns = []
-        d = self.kwargs['input_dims']
-        out_dim = 0
-        if self.kwargs['include_input']:
-            embed_fns.append(lambda x: x)
-            out_dim += d
+        self.mlp_base_mlp = torch.nn.Sequential(
+            torch.nn.Conv2d(32+pe_dim+rgd_dim, 64, 1, bias=False), torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 64, 1, bias=False), torch.nn.ReLU(),
+            )
+        
+        self.mlp_head1 = torch.nn.Conv2d(64, ks**2, 1, bias=False)
+        self.mlp_mask1 = torch.nn.Conv2d(64, 1, 1, bias=False)
 
-        max_freq = self.kwargs['max_freq_log2']
-        N_freqs = self.kwargs['num_freqs']
+        self.conv_rgbd = torch.nn.Sequential(
+            torch.nn.Conv2d(4, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
+            torch.nn.Conv2d(64, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
+            torch.nn.Conv2d(64, 32, 3,padding=1)
+            )
 
-        if self.kwargs['log_sampling']:
-            freq_bands = 2. ** torch.linspace(0., max_freq, steps=N_freqs)
+    def forward(self, img_idx, pos_enc, img):
+        img_embed = self.embedding_camera(torch.LongTensor([img_idx]).cuda())[None, None] # 1, 1, 1, 32
+        img_embed = img_embed.expand(pos_enc.shape[0],pos_enc.shape[1],pos_enc.shape[2],img_embed.shape[-1]) # 1, 400, 940, 32
+
+        if self.not_use_pe:
+            inp = img_embed.permute(0,3,1,2)
         else:
-            freq_bands = torch.linspace(2. ** 0., 2. ** max_freq, steps=N_freqs)
+            inp = torch.cat([img_embed,pos_enc],-1).permute(0,3,1,2) # 1, 48, 400, 940
 
-        for freq in freq_bands:
-            for p_fn in self.kwargs['periodic_fns']:
-                embed_fns.append(lambda x, p_fn=p_fn, freq=freq: p_fn(x * freq))
-                out_dim += d
-
-        self.embed_fns = embed_fns
-        self.out_dim = out_dim
-
-    def embed(self, inputs):
-        return torch.cat([fn(inputs) for fn in self.embed_fns], -1)
-'''
-
-class Blur(nn.Module): # xyz, 
-    def __init__(self, D=8, W=256, multires=10, n_pts = 5): # potision(3) + rotation(4) + scale(3)
-        super(Blur, self).__init__()
-        self.n_pts = n_pts
-        self.D = D 
-        self.W = W 
-        self.input_ch = n_pts * 2   # 10
-        self.output_ch = n_pts      # 1
-        self.skips = [3]            # skip connection
-        self.spatial_lr_scale = 5
-
-        # self.embed_fn, pos_encode_input_ch = get_embedder(multires, input_ch) # positional encoding function
-
-        blur_net = nn.ModuleList(
-            [nn.Linear(self.input_ch, W)] + [
-                nn.Linear(W, W) if i not in self.skips else nn.Linear(W + self.input_ch, W)
-                    for i in range(D - 2)] + [nn.Linear(W, self.output_ch)])
-        
-        self.blur = blur_net.cuda()
-        # self.knn = KNN(k=n_pts, transpose_mode=True)
-
-    def find_nearest_neighbors(self, points, k): # CPU is faster for this task
-
-        nbrs = NearestNeighbors(n_neighbors=k, algorithm='auto').fit(points)  
-        distances, indices = nbrs.kneighbors(points) # distances: near -> far
-        return distances, indices
-
-    def knn_chunk(self, reference, query, chunk=10000): # B, gs_num, 3
-        
-        fine_references = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
-        for i in range(0, query.shape[1], chunk):
-            indies = torch.tensor([], device="cuda") # B, chunk, k * j_num
-            for j in range(0, reference.shape[1], chunk):
-                _, index = self.knn(reference[:,j:j+chunk,:], query[:,i:i+chunk,:]) # B, chunk, k
-                indies = torch.cat((indies, index + j), dim=-1) # B, chunk, k * j_num; float32
-            fine_references = torch.cat((fine_references, reference.squeeze()[indies.int()]), dim=1) # B, chunk, k * j_num, 3 -> B, gs_num, k * j_num, 3
-
-        distances = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
-        indies = torch.tensor([], device="cuda") # B, gs_num, k * j_num, 3
-        for i in range(0, query.shape[1]): # gs_num
-            reference = fine_references[:,i,:,:] # B, k * j_num, 3
-            fine_query = query[:,i,:].unsqueeze(0) # B, 1, 3
-            distance, index = self.knn(reference, fine_query) # B, 1, k
-            indies = torch.cat((indies, index), dim=1) # B, gs_num, k
-            distances = torch.cat((distances, distance), dim=1) # B, gs_num, k
-
-        return distances, indies
-
-
-    def forward(self, xyz, opacity, d_xyz=None, d_rotation=None, d_scaling=None):
-
-        if d_xyz is not None:       
-            points = xyz + d_xyz
+        if self.not_use_rgbd:
+            feat = self.mlp_base_mlp(inp)
         else:
-            points = xyz # N, 3; N == 609
+            rgbd_feat = self.conv_rgbd(img) # 1, 32, 400, 940
+            feat = self.mlp_base_mlp(torch.cat([inp,rgbd_feat],1)) # 1, 64, 400, 940
 
-        points = points.to("cpu")
-        distances, indices = self.find_nearest_neighbors(points, self.n_pts) # N, k
-        
-        # prepare input: density, distance
-        distances = torch.tensor(distances, dtype=torch.float).to("cuda")
-        indices = torch.tensor(indices).to("cuda") # IndexError: too many indices for tensor of dimension 1
-        densities = opacity.squeeze() # N;
-        densities = densities[indices] # N, k
-        input = torch.cat((distances, densities), dim=-1) # N, 2k
+        weight = self.mlp_head1(feat) # 1, 9 * 9, 400, 940
+        mask = self.mlp_mask1(feat) # 1, 1, 400, 940
 
-        # learn blend weight
-        # input_emb = self.embed_fn(input) # positional encoding; 15006, 63
-        h = input
-        for i, l in enumerate(self.blur):
-            h = self.blur[i](h)
-            if i != self.D - 1:
-                h = F.relu(h) # MARK: RELU
-            else: 
-                h = F.softmax(h, dim=-1)
-            if i in self.skips:
-                h = torch.cat([input, h], dim=-1)
+        weight = torch.softmax(weight, dim=1)
+        mask = torch.sigmoid(mask)
 
-        torch.cuda.empty_cache() # MARK: GPU
-        return h, indices
+        return weight, mask
 
-    def train_setting(self, training_args): # Initialize the optimizer and the learning rate scheduler; training_args: opt
+
+    def train_setting(self): # Initialize the optimizer
         l = [
-            {'params': list(self.blur.parameters()),
-             'lr': training_args.position_lr_init * self.spatial_lr_scale,
-             "name": "blur"}
+            {'params':  list(self.embedding_camera.parameters()) +
+                        list(self.mlp_base_mlp.parameters()) +
+                        list(self.mlp_head1.parameters()) + 
+                        list(self.mlp_mask1.parameters()),
+             'lr': 5e-4}
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
-        self.blur_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-                                                       lr_final=training_args.position_lr_final,
-                                                       lr_delay_mult=training_args.position_lr_delay_mult,
-                                                       max_steps=training_args.dynamic_lr_max_steps)
 
-    def save_weights(self, model_path, iteration, starttime, operate):
-        out_weights_path = os.path.join(model_path, operate, starttime[:16], "blur/iteration_{}".format(iteration))
+    def save_weights(self, model_path, iteration, starttime, operate, best=False):   
+        if not best:
+            out_weights_path = os.path.join(model_path, operate, starttime[:16], "blur/iteration_{}".format(iteration))
+        else:
+            out_weights_path = os.path.join(model_path, operate, starttime[:16], "blur/iteration_66666")
         os.makedirs(out_weights_path, exist_ok=True)
-        torch.save(self.blur.state_dict(), os.path.join(out_weights_path, 'blur.pth'))
+        combined_state_dict = {
+            'embed': self.embedding_camera.state_dict(),
+            'base': self.mlp_base_mlp.state_dict(),
+            'head': self.mlp_head1.state_dict(),
+            'mask': self.mlp_mask1.state_dict()
+        }
+        torch.save(combined_state_dict, os.path.join(out_weights_path, 'blur.pth'))
 
     def load_weights(self, model_path, operate, time, iteration=-1):
         if iteration == -1:
@@ -168,13 +113,11 @@ class Blur(nn.Module): # xyz,
         else:
             loaded_iter = iteration
         weights_path = os.path.join(model_path, operate, time, "blur/iteration_{}/blur.pth".format(loaded_iter))
-        self.blur.load_state_dict(torch.load(weights_path))
+        combined_state_dict = torch.load(weights_path)
+        self.embedding_camera.load_state_dict(combined_state_dict['embed'])
+        self.mlp_base_mlp.load_state_dict(combined_state_dict['base'])
+        self.mlp_head1.load_state_dict(combined_state_dict['head'])
+        self.mlp_mask1.load_state_dict(combined_state_dict['mask'])
 
-    def update_learning_rate(self, iteration):
-        for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "blur":
-                lr = self.blur_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
     
 

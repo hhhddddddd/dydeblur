@@ -35,7 +35,7 @@ def inverse_gumbel_sigmoid(output, gumbel_noise, temperature=1, eps = 1e-10):
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution) # 800, 800
-    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0 # 800, 800, 3
+    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0 # 800, 800, 3; MARK: 0~255 -> 0~1
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1) # 3, 800, 800
     else:
@@ -172,7 +172,7 @@ def build_scaling_rotation(s, r):
     L[:, 1, 1] = s[:, 1]
     L[:, 2, 2] = s[:, 2]
 
-    L = R @ L
+    L = R @ L # R @ S
     return L
 
 
@@ -212,3 +212,25 @@ def Pseudocolorization(depth):
     depth=cv2.applyColorMap(cv2.convertScaleAbs(depth.cpu().squeeze(0).numpy() ,alpha=1),cv2.COLORMAP_JET)
 
     return torch.tensor(depth).permute(2, 0, 1)
+
+def get_emb(sin_inp):
+    """
+    Gets a base embedding for one dimension with sin and cos intertwined
+    """
+    emb = torch.stack((sin_inp.sin(), sin_inp.cos()), dim=-1)
+    return torch.flatten(emb, -2, -1)
+
+
+def get_2d_emb(batch_size, x, y, out_ch, device):
+    out_ch = int(np.ceil(out_ch / 4) * 2)
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, out_ch, 2).float() / out_ch))
+    pos_x = torch.arange(x, device=device).type(inv_freq.type())*2*np.pi/x
+    pos_y = torch.arange(y, device=device).type(inv_freq.type())*2*np.pi/y
+    sin_inp_x = torch.einsum("i,j->ij", pos_x, inv_freq)
+    sin_inp_y = torch.einsum("i,j->ij", pos_y, inv_freq)
+    emb_x = get_emb(sin_inp_x).unsqueeze(1)
+    emb_y = get_emb(sin_inp_y)
+    emb = torch.zeros((x, y, out_ch * 2), device=device)
+    emb[:, :, : out_ch] = emb_x
+    emb[:, :, out_ch : 2 * out_ch] = emb_y
+    return emb[None, :, :, :].repeat(batch_size, 1, 1, 1)

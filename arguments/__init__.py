@@ -54,6 +54,8 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self._model_path = ""
         self._operate = ""
         self._experiment = "Unimportant Experiment"
+        self._camera_scale = -1.
+        self._kernel = 9
         self._time = ""
         self._images = "images"
         self._resolution = -1
@@ -99,7 +101,7 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 15_000 # 15_000
         self.densify_grad_threshold = 0.0002
 
         self.gtnet_lr = 1e-3
@@ -107,7 +109,16 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.lambda_s=0.01
         self.lambda_p=0.01
 
-        self.unseen_lambda_dssim = 0.8
+        self.virtual_lambda_dssim = 0.8
+
+        self.use_mask_loss = True    # mask
+        self.mask_loss_alpha = 0.001    # 0.001
+        self.use_align_loss = False    # align
+        self.align_loss_alpha = 0.001   # 0.001
+        self.use_rgbtv_loss = False    # rgbtv
+        self.rgbtv_loss_alpha = 0.1     # 0.001  
+        self.use_depth_loss = False     # depth
+        self.depth_loss_alpha = 0.001   # 0.001 
         
         super().__init__(parser, "Optimization Parameters")
 

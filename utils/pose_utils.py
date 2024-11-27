@@ -171,7 +171,7 @@ class CameraPoseVisualizer:
         plt.savefig(path)
 
 
-def posevisual(save_path, train_c2ws, test_c2ws=None, virtual_c2ws=None): # c2w: n_poses, 3, 4 
+def posevisual(save_path, train_c2ws, test_c2ws=None, parallel_c2ws=None, vertical_c2ws=None, central_c2ws=None): # c2w: n_poses, 3, 4 
     visualizer = CameraPoseVisualizer([-20, 20], [-20, 20], [0, 15])
     
     if train_c2ws.shape[1] == 3:
@@ -193,15 +193,35 @@ def posevisual(save_path, train_c2ws, test_c2ws=None, virtual_c2ws=None): # c2w:
             # argument : extrinsic matrix, color, scaled focal length(z-axis length of frame body of camera
             visualizer.extrinsic2pyramid(c2w, 'g', 1, 0.6)
 
-    if virtual_c2ws != None:
-        if virtual_c2ws.shape[1] == 3:
-            bottom = np.array([[0,0,0,1]]).repeat(virtual_c2ws.shape[0], axis=0) # n_poses, 4
-            virtual_c2ws = np.concatenate([virtual_c2ws[..., :4], bottom[:,np.newaxis,:]], 1) # n_poses, 4, 4
+    if parallel_c2ws != None:
+        if parallel_c2ws.shape[1] == 3:
+            bottom = np.array([[0,0,0,1]]).repeat(parallel_c2ws.shape[0], axis=0) # n_poses, 4
+            parallel_c2ws = np.concatenate([parallel_c2ws[..., :4], bottom[:,np.newaxis,:]], 1) # n_poses, 4, 4
 
-        for idx in range(virtual_c2ws.shape[0]):
-            c2w = virtual_c2ws[idx].numpy()
+        for idx in range(parallel_c2ws.shape[0]):
+            c2w = parallel_c2ws[idx].numpy()
             # argument : extrinsic matrix, color, scaled focal length(z-axis length of frame body of camera
             visualizer.extrinsic2pyramid(c2w, 'b', 1, 0.6)
+
+    if vertical_c2ws != None:
+        if vertical_c2ws.shape[1] == 3:
+            bottom = np.array([[0,0,0,1]]).repeat(vertical_c2ws.shape[0], axis=0) # n_poses, 4
+            vertical_c2ws = np.concatenate([vertical_c2ws[..., :4], bottom[:,np.newaxis,:]], 1) # n_poses, 4, 4
+
+        for idx in range(vertical_c2ws.shape[0]):
+            c2w = vertical_c2ws[idx].numpy()
+            # argument : extrinsic matrix, color, scaled focal length(z-axis length of frame body of camera
+            visualizer.extrinsic2pyramid(c2w, 'y', 1, 0.6)
+
+    if central_c2ws != None:
+        if central_c2ws.shape[1] == 3:
+            bottom = np.array([[0,0,0,1]]).repeat(central_c2ws.shape[0], axis=0) # n_poses, 4
+            central_c2ws = np.concatenate([central_c2ws[..., :4], bottom[:,np.newaxis,:]], 1) # n_poses, 4, 4
+
+        for idx in range(central_c2ws.shape[0]):
+            c2w = central_c2ws[idx].numpy()
+            # argument : extrinsic matrix, color, scaled focal length(z-axis length of frame body of camera
+            visualizer.extrinsic2pyramid(c2w, 'k', 1, 0.6)
 
     visualizer.save(save_path)
     print("Camera Pose is OK!")

@@ -4,9 +4,13 @@ import sys
 import pdbr
 import time
 import json
+import imageio
+import random
+from random import randint
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import numpy as np
 import cv2
 from PIL import Image
@@ -146,30 +150,44 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 
 ######################## train test camera distance ########################
 # path = "/home/xuankai/code/d-3dgs/data/D2RF/"
-path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
-for scene in sorted(os.listdir(path)):
+# path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+# for scene in sorted(os.listdir(path)):
 
-    # pose_path = path + scene + "/poses_bounds.npy"
-    pose_path = path + scene + "/dense/poses_bounds.npy"
+#     # pose_path = path + scene + "/poses_bounds.npy"
+#     pose_path = path + scene + "/dense/poses_bounds.npy"
     
-    poses_arr = np.load(pose_path)
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]) # 34, 3, 5
+#     poses_arr = np.load(pose_path)
+#     poses = poses_arr[:, :-2].reshape([-1, 3, 5]) # 34, 3, 5
 
-    train_poses = []
-    test_poses = []
-    for i in range(len(poses)):
-        if i % 2 == 0:
-            train_pose = poses[i]
-            train_poses.append(train_pose)
-        else: 
-            test_pose = poses[i]
-            test_poses.append(test_pose)
-    train_center = np.stack(train_poses)[:, :, 3] # 17, 3
-    test_center = np.stack(test_poses)[:, :, 3] # 17, 3
-    distance = np.linalg.norm((train_center - test_center),axis=1)
-    distance_mean = distance.mean()
+#     train_poses = []
+#     test_poses = []
+#     for i in range(len(poses)):
+#         if i % 2 == 0:
+#             train_pose = poses[i]
+#             train_poses.append(train_pose)
+#         else: 
+#             test_pose = poses[i]
+#             test_poses.append(test_pose)
+#     # train_center = np.stack(train_poses)[:, :, 3] # 17, 3
+#     # test_center = np.stack(test_poses)[:, :, 3] # 17, 3
+#     # distance = np.linalg.norm((train_center - test_center),axis=1)
+#     # distance_mean = distance.mean()
 
-    print(scene, "distance mean:", distance_mean)
+#     train_center_z = np.stack(train_poses)[:, -1, 3] # 17, 3
+#     test_center_z = np.stack(test_poses)[:, -1, 3] # 17, 3
+#     distance = abs(train_center_z - test_center_z)
+#     # distance = train_center_z - test_center_z
+#     # print(scene)
+#     distance_mean = distance.mean()
+
+#     print(scene, "z-distance mean:", distance_mean)
 ######################## train test camera distance ########################
 
-print('end')
+kernel_weights = torch.rand(1, 81, 400, 940)
+kernel = 9
+kernel_center = kernel_weights[:, ((kernel * kernel) // 2), :, :].cuda() # batch, 400, 940
+target = (torch.ones(kernel_weights.shape[0], kernel_weights.shape[-2], kernel_weights.shape[-1]) * 1.).cuda() # batch, 400, 940
+alignloss = (target - kernel_center).abs().mean() # batch, 400, 940 -> torch.Size([])
+
+
+

@@ -11,8 +11,9 @@ class DeformModel:
     def __init__(self, is_blender=False, is_6dof=False, spatial_lr_scale=5):
         self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda() # MARK: cuda
         self.optimizer = None
-        # self.spatial_lr_scale = 0.25
-        self.spatial_lr_scale = spatial_lr_scale   # scale factor: Adjusts the learning rate scaling for different spatial locations
+        # self.spatial_lr_scale = 0.5
+        self.spatial_lr_scale = 5.0
+        # self.spatial_lr_scale = spatial_lr_scale   # scale factor: Adjusts the learning rate scaling for different spatial locations
         print('DeforModel cameras_extent =', self.spatial_lr_scale) # FIXME 
 
     def step(self, xyz, time_emb):
@@ -27,7 +28,7 @@ class DeformModel:
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.deform_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-                                                       lr_final=training_args.position_lr_final,
+                                                       lr_final=training_args.position_lr_final, # * self.spatial_lr_scale, # NOTE
                                                        lr_delay_mult=training_args.position_lr_delay_mult,
                                                        max_steps=training_args.deform_lr_max_steps)
 

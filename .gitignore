@@ -9,5 +9,6 @@ screenshots
 .ideas
 data
 assets
+models
 pretrained
 *.md

@@ -44,6 +44,8 @@ class CameraInfo(NamedTuple):
     fid: float          # frame time
     depth: Optional[np.array] = None
     depthv2: Optional[np.array] = None
+    blur_map: Optional[np.array] = None
+    motion_mask: Optional[np.array] = None
 
     K: np.array = None
     bounds: np.array = None
@@ -278,10 +280,10 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             cam_name = os.path.join(path, frame["file_path"] + extension)
             frame_time = frame['time']
 
-            matrix = np.linalg.inv(np.array(frame["transform_matrix"])) # calculate inverse matrix NOTE
-            R = -np.transpose(matrix[:3, :3])
-            R[:, 0] = -R[:, 0]
-            T = -matrix[:3, 3]
+            matrix = np.linalg.inv(np.array(frame["transform_matrix"])) # frame["transform_matrix"]: c2w (OpenGL/Blender), matrix: w2c
+            R = -np.transpose(matrix[:3, :3]) # OpenGL/Blender -> Colmap
+            R[:, 0] = -R[:, 0] # OpenGL/Blender -> Colmap
+            T = -matrix[:3, 3] # why negative?
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem # image_name: r_000
@@ -677,7 +679,7 @@ def recenter_poses(poses): # poses: 48, 3, 5
     poses = poses_
     return poses
 
-def readD2RFCameras(path):
+def readD2RFCameras(path, camera_scale=-1):
     poses_arr = np.load(os.path.join(path, 'poses_bounds.npy')) # MARK: load camera pose
     
     poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3, 5, 34
@@ -693,6 +695,10 @@ def readD2RFCameras(path):
     depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # image depth 
     depth_fine_dir = os.path.join(path, 'dpt') # depth anything v2
     depth_fine_files = [os.path.join(depth_fine_dir, f) for f in sorted(os.listdir(depth_fine_dir)) if f.endswith('npy')] # depth map path
+    blur_map_dir = os.path.join(path, 'blur_masks_npy') # DMENet
+    blur_map_files = [os.path.join(blur_map_dir, f) for f in sorted(os.listdir(blur_map_dir)) if f.endswith('npy')] # blur map path
+    motion_mask_dir = os.path.join(path, 'motion_masks') # motion mask
+    motion_mask_files = [os.path.join(motion_mask_dir, f) for f in sorted(os.listdir(motion_mask_dir)) if f.endswith('png')] # motion mask path
 
     sh = imageio.imread(imgfiles[0]).shape # 400, 940, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width in poses
@@ -707,11 +713,14 @@ def readD2RFCameras(path):
     poses = np.moveaxis(poses, -1, 0).astype(np.float32) # 34, 3, 5
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)     # 34, 2
 
-    bd_factor = 0.9
-    sc =  1./(np.percentile(bds[:, 0], 5) * bd_factor)
-    print('sc =',sc)
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(np.percentile(bds[:, 0], 5) * bd_factor)
+    else:
+        sc = camera_scale
     poses[:,:3,3] *= sc # change camera center
     bds *= sc
+    print('sc =',sc)
 
     # poses = recenter_poses(poses) # FIXME Is it necessary?
 
@@ -735,7 +744,7 @@ def readD2RFCameras(path):
             img = Image.open(img_path)
         else: 
             img_path = imgfiles_sharp[idx]
-            img = Image.open(img_path)
+            img = Image.open(img_path) # 0~255
             img = img.resize((sh[1],sh[0])) # resize sharp
         
         image_name = os.path.basename(img_path).split(".")[0] # 000000_left
@@ -744,11 +753,15 @@ def readD2RFCameras(path):
         depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 400, 940
         depthv2 = np.load(depth_fine_files[idx])
         depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
-        
-        uid =  idx // 2             # colmap_id,    unsureness
-        fid = idx // 2 
+        blur_map = np.load(blur_map_files[idx]) # small is sharp, 400, 940
+        blur_map = 1 - (blur_map - blur_map.min()) / (blur_map.max() - blur_map.min()) # large is sharp
+        motion_mask = np.array(Image.open(motion_mask_files[idx]))
+        motion_mask = np.clip(motion_mask, 0.0, 1.0) # large is dynamic
 
-        c2w = poses[idx, :3, :4]                
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = (idx // 2) / (len(poses) // 2)
+
+        c2w = poses[idx, :3, :4]          
         bottom = np.reshape([0,0,0,1.], [1,4])
         c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # c2w, homogeneous coordinates
         matrix = np.linalg.inv(np.array(c2w))           # w2c, homogeneous coordinates
@@ -757,14 +770,14 @@ def readD2RFCameras(path):
         
         bounds = bds[idx]
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2,
-                              image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2, blur_map=blur_map,
+                              motion_mask=motion_mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
     return cam_infos, sc
     
-def readD2RFDataset(path, eval = True, llffhold = 2):
+def readD2RFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
-    cam_infos_unsorted, sc = readD2RFCameras(path)
+    cam_infos_unsorted, sc = readD2RFCameras(path, camera_scale)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval: # divide the training set and test set
@@ -890,7 +903,7 @@ def readD2RFDataset(path, eval = True, llffhold = 2):
                            sc=sc)
     return scene_info
 
-def readDyBluRFCameras(path):
+def readDyBluRFCameras(path, camera_scale=-1):
 
     poses_arr = np.load(os.path.join(path, 'poses_bounds.npy')) # 48, 17; MARK: camera pose
 
@@ -907,7 +920,11 @@ def readDyBluRFCameras(path):
     depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
     depth_fine_dir = os.path.join(path, 'disp') # depth anything v2
     depth_fine_files = [os.path.join(depth_fine_dir, f) for f in sorted(os.listdir(depth_fine_dir)) if f.endswith('npy')] # depth map path
-    
+    blur_map_dir = os.path.join(path, 'blur_masks_npy') # DMENet
+    blur_map_files = [os.path.join(blur_map_dir, f) for f in sorted(os.listdir(blur_map_dir)) if f.endswith('npy')] # blur map path
+    motion_mask_dir = os.path.join(path, 'motion_masks') # motion mask
+    motion_mask_files = [os.path.join(motion_mask_dir, f) for f in sorted(os.listdir(motion_mask_dir)) if f.endswith('png')] # motion mask path
+
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
     poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width
     poses[2, 4, :] = poses[2, 4, :] * 1. / 2.5 # change focal
@@ -921,12 +938,14 @@ def readDyBluRFCameras(path):
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)    # 48, 3, 5
     bds = np.moveaxis(bds, -1, 0).astype(np.float32)        # 48, 2
 
-    print("bds:",bds.max(),bds.min())
-    bd_factor = 0.9
-    sc = 1. if bd_factor is None else 1. / (np.percentile(bds[:, 0], 5) * bd_factor)
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(np.percentile(bds[:, 0], 5) * bd_factor)
+    else:
+        sc = camera_scale
+    poses[:,:3,3] *= sc # change camera center
+    bds *= sc
     print('sc =',sc)
-    poses[:, :3, 3] *= sc # change camera center
-    bds *= sc # change point bound
 
     # poses = recenter_poses(poses) # FIXME Is it necessary?
 
@@ -951,17 +970,23 @@ def readDyBluRFCameras(path):
             depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 288, 512
             depthv2 = np.load(depth_fine_files[idx // 2])
             depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
+            blur_map = np.load(blur_map_files[idx // 2]) # small is sharp, 288, 512
+            blur_map = 1 - (blur_map - blur_map.min()) / (blur_map.max() - blur_map.min()) # large is sharp
+            motion_mask = np.array(Image.open(motion_mask_files[idx // 2]))
+            motion_mask = np.clip(motion_mask, 0.0, 1.0) # large is dynamic
         else:
             img_path = imgfiles_inference[idx // 2] # MARK: test image
             depth = None
             depthv2 = None
+            blur_map = None
+            motion_mask = None
         img = Image.open(img_path) # 288, 512, 3
         if img.size[0] != sh[1]:
             img = img.resize((sh[1],sh[0])) # resize sharp
         image_name = os.path.basename(img_path).split(".")[0] # 00000
         
         uid =  idx // 2             # colmap_id,    unsureness
-        fid = idx // 2 
+        fid = (idx // 2) / (len(poses) // 2)
 
         c2w = poses[idx, :3, :4]                
         bottom = np.reshape([0,0,0,1.], [1,4])
@@ -972,8 +997,8 @@ def readDyBluRFCameras(path):
         
         bounds = bds[idx] # min: ~1.0, max: ~2.0
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2,
-                              image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, bounds=bounds, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, depthv2=depthv2, blur_map=blur_map,
+                              motion_mask=motion_mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
         cam_infos.append(cam_info)
 
     return cam_infos, sc
@@ -994,20 +1019,108 @@ def readDyBluRFDataset(path, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
 
-    ply_path = os.path.join(path, "sparse_/points3D.ply") # NOTE colmap point cloud
-    bin_path = os.path.join(path, "sparse_/points3D.bin")
-    txt_path = os.path.join(path, "sparse_/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    depth_point = False
+    # depth_point =True
+    if depth_point:
+        ply_path = os.path.join(path, "depth.ply")
+        # if not os.path.exists(ply_path): # NOTE first-frame depth point
+        image_path = sorted(os.listdir(os.path.join(path,"images_512x288")))[0]
+        depth_path = sorted(os.listdir(os.path.join(path,"disp")))[0]
+        pose_path = os.path.join(path,"poses_bounds.npy")
+
+        image = Image.open(os.path.join(path, "images_512x288", image_path))
+        image = np.array(image).reshape(-1, 3) # 360, 940, 3 -> 360 * 940, 3
+        # depth = np.load(os.path.join(path, "disp", depth_path)).reshape(-1, 1) # 360 * 940, 1
+        depth = np.load(os.path.join(path, "disp", depth_path)) # sailor: 384, 672; strange ???
+        depth = cv.resize(depth, (512, 288), interpolation=cv.INTER_NEAREST).reshape(-1, 1)
+        depth = (depth.max() + depth.min()) - depth # inverse depth -> depth
+        pose = np.load(pose_path)[:, :-2].reshape([-1, 3, 5])[0] # 3, 5
+
+        height, width, focal = pose[:, 4] / 2.5 # height = 282.8, weight = 503.6, focal = 276.22
+        height = 288
+        width = 512
+        c2w = pose[:3, :4]
+        c2w = np.concatenate([c2w[:, 0:1], -c2w[:, 1:2], -c2w[:, 2:3], c2w[:, 3:4]], 1) # llff (DRB) -> colmap (RDF)
+        xs, ys = np.meshgrid(np.arange(width), np.arange(height)) # 360, 940
+        xs, ys = xs.reshape(-1, 1), ys.reshape(-1, 1) # 360 * 940, 1
+
+        xs = depth * (xs - (width/2)) / focal
+        ys = depth * (ys - (height/2)) / focal  
+        xyz_cam = np.stack((xs, ys, depth), -1) # 360 * 940, 1, 3
+        xyz_cam = np.squeeze(xyz_cam, axis=1) # 360 * 940, 3
+        xyz_world = xyz_cam.astype(np.float64) @ c2w[:3, :3].T + c2w[:3, 3:4].reshape((1, 3)) # 360 * 940, 3
+        
+        # point cloud alignment manually
+        # xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
+        # xyz_center = (xyz_max + xyz_min) * 0.5
+        # affinemat = np.eye(4) # Affine transformation matrix
+        # affinemat[0, -1], affinemat[1, -1], affinemat[2, -1] = -xyz_center[0], -xyz_center[1], -xyz_min[2] + 1000.
+        # ones = np.ones(xyz_world.shape[0])[:, np.newaxis]
+        # xyz_world = np.concatenate([xyz_world, ones], -1) # Homogeneous coordinates
+        # xyz_world = xyz_world @ affinemat.T
+        # xyz_world = xyz_world[:, :-1] * 0.001 # scale
+
+        # depth_point remove extrem outliers
+        remove_outliers = True
+        if remove_outliers:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(xyz_world)
+            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.) # larger std_ratio, more point
+            image = image[ind]
+            xyz_world = np.array(pcd.points)
+
+        # point cloud alignment sfm
+        ply_sfm_path = os.path.join(path, "sparse_/points3D.ply")
+        ply_sfm_data = PlyData.read(ply_sfm_path)
+        vertices = ply_sfm_data['vertex']
+        points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+        # sfm_point remove extrem outliers
+        remove_outliers = True
+        if remove_outliers:
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(points)
+            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.75)
+            points = np.array(pcd.points)
+
+        pcd_sfm_max, pcd_sfm_min = points.max(0), points.min(0) # points: n_points, 3
+        dist_sfm_max = pcd_sfm_max - pcd_sfm_min
+
+        xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
+        xyz_range = xyz_max - xyz_min
+
+        points = (xyz_world - xyz_min) / xyz_range
+        xyz_world = points * dist_sfm_max * 1.1 + pcd_sfm_min * 1.1
+
+        # Farthest Point Sampling
+        FSP = True
+        if FSP:
+            print('Start Farthest Point Sampling ...')
+            random_idx = farthest_point_sample(torch.tensor(xyz_world[np.newaxis,...]).cuda(), 100_000).squeeze(0).cpu().numpy()
+            print('End Farthest Point Sampling! ')
+            xyz_world = xyz_world[random_idx]
+            image = image[random_idx]
+
+        storePly(ply_path, xyz_world, image)
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+            pcd = None
+    else:
+        ply_path = os.path.join(path, "sparse_/points3D.ply") # NOTE sfm point cloud
+        bin_path = os.path.join(path, "sparse_/points3D.bin")
+        txt_path = os.path.join(path, "sparse_/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     '''
     # if not os.path.exists(os.path.join(path, "mvs.ply")): # NOTE MVS point cloud

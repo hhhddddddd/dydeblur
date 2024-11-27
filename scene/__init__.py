@@ -34,7 +34,7 @@ class Scene:
     gaussians: GaussianModel # class attribute
 
     def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True,
-                 resolution_scales=[1.0]):
+                 resolution_scales=[1.0], train=True):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -78,7 +78,7 @@ class Scene:
 
         elif os.path.exists(os.path.join(args.source_path, "background_mask")):
             print("Found background_mask, assuming D2RF data set!")
-            scene_info = sceneLoadTypeCallbacks["D2RF"](args.source_path) # D2RF
+            scene_info = sceneLoadTypeCallbacks["D2RF"](args.source_path, args.camera_scale) # D2RF
 
         elif os.path.exists(os.path.join(args.source_path, "sharp_images")):
             print("Found sharp_images, assuming DyBluRF data set!")
@@ -106,7 +106,7 @@ class Scene:
 
 
         self.cameras_extent = scene_info.nerf_normalization["radius"] # cameras_extent: the max distance between mean_camera_center and camera 
-        print('cameras_extent =', self.cameras_extent)
+        print('First cameras_extent =', self.cameras_extent)
         for resolution_scale in resolution_scales:  # CameraInfo -> Camera; MARK: resize image
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
@@ -115,8 +115,9 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
                                                                            args)
             # get unseen cameras
-            print("Generating Virtual Cameras")
-            self.virtual_cameras[resolution_scale] = self.generateVirtualCams(self.train_cameras[resolution_scale], self.test_cameras[resolution_scale], scene_info.sc)
+            if train:
+                print("Generating Virtual Cameras")
+                self.virtual_cameras[resolution_scale] = self.generateVirtualCams(self.train_cameras[resolution_scale], self.test_cameras[resolution_scale], scene_info.sc)
             torch.cuda.empty_cache()
 
         # shuffle train camera and test camera
@@ -124,11 +125,13 @@ class Scene:
             for resolution_scale in resolution_scales:
                 self.sorted_train_cameras[resolution_scale] = self.train_cameras[resolution_scale].copy()
                 self.sorted_test_cameras[resolution_scale] = self.test_cameras[resolution_scale].copy()
-                self.sorted_virtual_cameras[resolution_scale] = self.virtual_cameras[resolution_scale].copy()
+                if train:
+                    self.sorted_virtual_cameras[resolution_scale] = self.virtual_cameras[resolution_scale].copy()
 
                 random.shuffle(self.train_cameras[resolution_scale])  # Multi-res consistent random shuffling
                 random.shuffle(self.test_cameras[resolution_scale])  # Multi-res consistent random shuffling
-                random.shuffle(self.virtual_cameras[resolution_scale])  # Multi-res consistent random shuffling
+                if train:
+                    random.shuffle(self.virtual_cameras[resolution_scale])  # Multi-res consistent random shuffling
      
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path, args.operate, args.time,
@@ -172,54 +175,87 @@ class Scene:
     def getSortedVirtualCameras(self, scale=1.0):
         return self.sorted_virtual_cameras[scale]
 
-    def generateVirtualCams(self, input_cams, target_cams, sc, batch_size=1, inpaint=True):
+    def generateVirtualCams(self, input_cams, target_cams, sc, batch_size=4, inpaint=True):
         print('Train view num: ', len(input_cams))
 
-        only_right = False
-        # only_right = True
-        input_imgs, mvs_depths, input_extrs, input_intrs, target_extrs, target_intrs = self.prepare_data(input_cams, target_cams, sc, only_right) # mvs_depths: absolute depth
+        input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, target_extrs, target_intrs = self.prepare_data(input_cams, target_cams, sc) # mvs_depths: absolute depth
 
         # split into batches
-        input_batches = create_batches(input_imgs, mvs_depths, input_extrs, input_intrs, batch_size=batch_size)
+        input_batches = create_batches(input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, batch_size=batch_size)
         target_batches = create_batches(target_intrs, target_extrs, batch_size=batch_size)
 
         warper = Warper()
         warped_frames, valid_masks, warped_depths = [], [], []
+        warped_blur_maps, warped_blur_masks = [], []
+        warped_motion_maps, warped_motion_masks = [], []
         with torch.no_grad():
-            for (input_imgs_batch, mvs_depths_batch, input_extrs_batch, input_intrs_batch), (target_intrs_batch, target_extrs_batch) \
+            for (input_imgs_batch, input_blur_batch, input_motion_batch, mvs_depths_batch, input_extrs_batch, input_intrs_batch), (target_intrs_batch, target_extrs_batch) \
                 in tqdm(zip(input_batches, target_batches), desc="Unseen view prior", unit="batch", total=int(len(input_imgs) / batch_size)):
                 torch.cuda.empty_cache()
                 masks_batch = None
                 # get priors for unseen views by forward warping
                 warped_frame, valid_mask, warped_depth, _ = warper.forward_warp(input_imgs_batch, masks_batch, mvs_depths_batch, input_extrs_batch, 
                                                                                 target_extrs_batch, input_intrs_batch, target_intrs_batch)
-                warped_frames.append(warped_frame.cpu())
-                valid_masks.append(valid_mask.cpu())
-                warped_depths.append(warped_depth.cpu()) # very inaccurate
+                warped_frames.append(warped_frame.cpu()) # batch_size, 3, 288, 512
+                valid_masks.append(valid_mask.cpu()) # batch_size, 1, 288, 512
+                warped_depths.append(warped_depth.cpu()) # batch_size, 1, 288, 512; very inaccurate
                 
+                warped_blur_map, warped_blur_mask, _, _ = warper.forward_warp(input_blur_batch, masks_batch, mvs_depths_batch, input_extrs_batch, 
+                                                                                target_extrs_batch, input_intrs_batch, target_intrs_batch)
+                warped_blur_maps.append(warped_blur_map.cpu()) # batch_size, 3, 288, 512; 3 is repeat
+                warped_blur_masks.append(warped_blur_mask.cpu()) # batch_size, 1, 288, 512            
 
-        warped_depths = torch.cat(warped_depths, dim=0)
-        valid_masks = torch.cat(valid_masks, dim=0)
-        warped_frames = torch.cat(warped_frames, dim=0)
+                warped_motion_map, warped_motion_mask, _, _ = warper.forward_warp(input_motion_batch, masks_batch, mvs_depths_batch, input_extrs_batch, 
+                                                                                target_extrs_batch, input_intrs_batch, target_intrs_batch)
+                warped_motion_maps.append(warped_motion_map.cpu()) # batch_size, 3, 288, 512; 3 is repeat
+                warped_motion_masks.append(warped_motion_mask.cpu()) # batch_size, 1, 288, 512    
+
+        warped_depths = torch.cat(warped_depths, dim=0) # N, 1, 288, 512
+        valid_masks = torch.cat(valid_masks, dim=0) # N, 1, 288, 512
+        warped_frames = torch.cat(warped_frames, dim=0) # N, 3, 288, 512
+
+        warped_blur_maps = torch.cat(warped_blur_maps, dim=0) # N, 3, 288, 512
+        warped_blur_masks = torch.cat(warped_blur_masks, dim=0) # N, 1, 288, 512
+
+        warped_motion_maps = torch.cat(warped_motion_maps, dim=0) # N, 3, 288, 512
+        warped_motion_masks = torch.cat(warped_motion_masks, dim=0) # N, 1, 288, 512
+
+        if inpaint:
+            simple_lama = SimpleLama() # use Lama for inpainting if needed
 
         print('Virtual view num: ', len(warped_frames))
         virtual_cams = []
-        if inpaint:
-            simple_lama = SimpleLama() # use Lama for inpainting if needed
+        unit = len(warped_frames) // batch_size
         for i in range(len(warped_frames)):
-            id = len(input_cams) + i # uid
-            if i < (len(warped_frames) // 4):
+            id = len(input_cams) + i # camera id
+
+            if i < unit:
+                uid = input_cams[i].uid
                 fid = input_cams[i].fid.cpu().numpy().squeeze(0)
-                image_name = input_cams[i].image_name + '_p'
-            elif i < (len(warped_frames) // 2):
-                fid = input_cams[i-(len(warped_frames)//4)+1].fid.cpu().numpy().squeeze(0)
-                image_name = input_cams[i-(len(warped_frames)//4)+1].image_name + '_p'
+                image_name = input_cams[i].image_name + '_pr'
+            elif i < 2*unit:
+                uid = input_cams[i % unit + 1].uid
+                fid = input_cams[i % unit + 1].fid.cpu().numpy().squeeze(0)
+                image_name = input_cams[i % unit + 1].image_name + '_pl'
+            elif i < 4*unit:
+                uid = input_cams[i % unit].uid
+                fid = input_cams[i % unit].fid.cpu().numpy().squeeze(0)
+                image_name = input_cams[i % unit].image_name + '_vr'
+            elif i < 6*unit:
+                uid = input_cams[i % unit + 1].uid
+                fid = input_cams[i % unit + 1].fid.cpu().numpy().squeeze(0)
+                image_name = input_cams[i % unit + 1].image_name + '_vl'
+            elif i < 8*unit:
+                uid = input_cams[i % unit].uid
+                fid = input_cams[i % unit].fid.cpu().numpy().squeeze(0)
+                image_name = input_cams[i % unit].image_name + '_cr'
             else:
-                fid = input_cams[i % (len(warped_frames)//4)].fid.cpu().numpy().squeeze(0)
-                image_name = input_cams[i % (len(warped_frames)//4)].image_name + '_v'
+                uid = input_cams[i % unit + 1].uid
+                fid = input_cams[i % unit + 1].fid.cpu().numpy().squeeze(0)
+                image_name = input_cams[i % unit + 1].image_name + '_cl'
 
             C2W = target_extrs[i].inverse()
-            C2W[:3, 3] = C2W[:3, 3] * sc
+            C2W[:3, 3] = C2W[:3, 3] * sc # MARK: scale
             target_extr = C2W.inverse()
             R, T = target_extr[:3, :3].cpu().numpy().transpose(), target_extr[:3, 3].cpu().numpy()
             focal_length_x, focal_length_y = target_intrs[i][0,0], target_intrs[i][1,1]
@@ -231,18 +267,35 @@ class Scene:
             ], dtype=np.float32)
             FovY = focal2fov(focal_length_y, H)
             FovX = focal2fov(focal_length_x, W)
-            warped_img = warped_frames[i]
-            mask = valid_masks[i].squeeze().to(torch.bool).detach().cpu().numpy()
             depth = warped_depths[i].cpu().numpy().squeeze(0)
+
+            warped_img = warped_frames[i] # 3, 288, 512
+            mask = valid_masks[i].squeeze().to(torch.bool).detach().cpu().numpy() # 288, 512
+
+            warped_blur_map = warped_blur_maps[i] # 3, 288, 512; 3 is repeat
+            warped_blur_mask = warped_blur_masks[i].squeeze().to(torch.bool).detach().cpu().numpy() # 288, 512
+
+            warped_motion_map = warped_motion_maps[i] # 3, 288, 512; 3 is repeat
+            warped_motion_mask = warped_motion_masks[i].squeeze().to(torch.bool).detach().cpu().numpy() # 288, 512
+
             if inpaint:# inpaint
-                warped_img = warped_img.permute(1,2,0).cpu().numpy()
-                warped_img = torch.from_numpy(np.array(simple_lama(warped_img*255, (~mask).astype(np.uint8)*255))[:H, :W]).permute(2,0,1)/255.
-            
+                warped_img = warped_img.permute(1,2,0).cpu().numpy() # 288, 512, 3
+                warped_img = torch.from_numpy(np.array(simple_lama(warped_img*255, (~mask).astype(np.uint8)*255))[:H, :W]).permute(2,0,1)/255. # 3, 288, 512
+
+                warped_blur_map = warped_blur_map.permute(1,2,0).cpu().numpy() # 288, 512, 3; 3 is repeat
+                warped_blur_map = torch.from_numpy(np.array(simple_lama(warped_blur_map*255, (~warped_blur_mask).astype(np.uint8)*255))[:H, :W]).permute(2,0,1)/255. # 3, 288, 512; 3 is repeat
+                warped_blur_map = warped_blur_map[0,:,:].squeeze(0) # 288, 512
+
+                warped_motion_map = warped_motion_map.permute(1,2,0).cpu().numpy() # 288, 512, 3; 3 is repeat
+                warped_motion_map = torch.from_numpy(np.array(simple_lama(warped_motion_map*255, (~warped_motion_mask).astype(np.uint8)*255))[:H, :W]).permute(2,0,1)/255. # 3, 288, 512; 3 is repeat
+                warped_motion_map = warped_motion_map[0,:,:].squeeze(0) # 288, 512
+                warped_motion_map = warped_motion_map > 0.9                
+                
             virtual_cam = Camera(colmap_id=None, R=R, T=T, K=K, fid=fid,
                                 FoVx=FovX, FoVy=FovY, 
                                 image=warped_img, gt_alpha_mask=None,
-                                image_name=image_name, uid=id, data_device='cuda',
-                                depth=depth, is_virtual=True)
+                                image_name=image_name, uid=uid, data_device='cuda',
+                                depth=depth, blur_map=warped_blur_map, motion_mask=warped_motion_map, is_virtual=True)
             virtual_cams.append(virtual_cam)
 
         return virtual_cams
@@ -260,42 +313,77 @@ class Scene:
         Rt = np.linalg.inv(C2W)
         return np.float32(Rt)
     
-    def prepare_data(self, input_cams, target_cams, sc=1., only_right=True):
+    def prepare_data(self, input_cams, target_cams, sc=1.):
         
         ids = range(len(target_cams))
         
         input_imgs = torch.stack([input_cams[id].original_image for id in ids]) # v_num, 3, 288, 512
+        input_blur_maps = torch.stack([input_cams[id].blur_map for id in ids]).unsqueeze(1).repeat(1, 3, 1, 1) # v_num, 3, 288, 512
+        input_motion_masks = torch.stack([input_cams[id].motion_mask for id in ids]).unsqueeze(1).repeat(1, 3, 1, 1) # v_num, 3, 288, 512
         mvs_depths = torch.from_numpy(np.stack([input_cams[id].depth.cpu() for id in ids])).unsqueeze(1) # v_num, 1, 288, 512
         input_extrs = torch.from_numpy(np.stack([self.getWorld2View2(input_cams[id].R, input_cams[id].T, sc) for id in ids])) # v_num, 4, 4
         input_intrs = torch.from_numpy(np.stack([input_cams[id].K for id in ids])) # v_num, 3, 3
 
-        # target_extrs = torch.from_numpy(np.stack([getWorld2View(target_cams[id].R, target_cams[id].T) for id in ids])) # v_num, 4, 4
+        # target_extrs = torch.from_numpy(np.stack([self.getWorld2View2(target_cams[id].R, target_cams[id].T, sc) for id in ids])) # v_num, 4, 4
         # target_intrs = torch.from_numpy(np.stack([target_cams[id].K for id in ids])) # v_num, 3, 3
 
         parallel_poses = torch.from_numpy(parallel_trajectory_interpolation(input_extrs)) # c2w
         parallel_extrs = torch.from_numpy(np.stack([np.linalg.inv(parallel_poses[i]) for i in range(parallel_poses.shape[0])])) # w2c
         parallel_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(parallel_extrs)))  # same intrinsics
-        vertical_poses = torch.from_numpy(vertical_trajectory_interpolation(input_extrs)) # c2w
+        vertical_poses = torch.from_numpy(vertical_trajectory_interpolation(input_extrs, right=0., left=0.)) # c2w
         vertical_extrs = torch.from_numpy(np.stack([np.linalg.inv(vertical_poses[i]) for i in range(vertical_poses.shape[0])])) # w2c
         vertical_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(vertical_extrs)))  # same intrinsics
+        # central_poses = torch.from_numpy(central_interpolation(input_extrs, right=0., left=0.)) # c2w
+        # central_extrs = torch.from_numpy(np.stack([np.linalg.inv(central_poses[i]) for i in range(central_poses.shape[0])])) # w2c
+        # central_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(central_extrs)))  # same intrinsics
 
+        # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...], \
+        #                         input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE all 
+        # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...], \
+        #                         mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
+        # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...], \
+        #                          input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...]], dim=0)
+        # input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...], \
+        #                          input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...]], dim=0)
+        # target_extrs = torch.cat([parallel_extrs.repeat(2, 1, 1), vertical_extrs, central_extrs], dim=0)
+        # target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs, central_intrs], dim=0)
 
-        input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...]], dim=0).cpu()
+        # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE only_pv
+        # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
+        # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...]], dim=0)
+        # input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...]], dim=0)
+        # target_extrs = torch.cat([parallel_extrs.repeat(2, 1, 1), vertical_extrs], dim=0)
+        # target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs], dim=0)
+
+        input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...]], dim=0).cpu() # NOTE only_vertical_right
+        input_blur_maps = torch.cat([input_blur_maps[:-1,...], input_blur_maps[1:,...], input_blur_maps[:-1,...], input_blur_maps[:-1,...]], dim=0).cpu()
+        input_motion_masks = torch.cat([input_motion_masks[:-1,...], input_motion_masks[1:,...], input_motion_masks[:-1,...], input_motion_masks[:-1,...]], dim=0).cpu()
         mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...]], dim=0).cpu()
         input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...]], dim=0)
         input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...]], dim=0)
         target_extrs = torch.cat([parallel_extrs.repeat(2, 1, 1), vertical_extrs], dim=0)
         target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs], dim=0)
 
+        # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE vright_cleft
+        # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
+        # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...]], dim=0)
+        # input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...]], dim=0)
+        # target_extrs = torch.cat([parallel_extrs.repeat(2, 1, 1), vertical_extrs, central_extrs], dim=0)
+        # target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs, central_intrs], dim=0)
+
         visual = False
+        # visual = True
         if visual:
-            save_path = "/home/xuankai/aimage/pv_pose"
+            save_path = "/home/xuankai/aimage/vitual_pose"
+            save_path1 = "/home/xuankai/aimage/test_pose"
             train_c2ws = torch.from_numpy(np.stack([np.linalg.inv(self.getWorld2View2(input_cams[id].R, input_cams[id].T, sc)) for id in ids]))
             test_c2ws = torch.from_numpy(np.stack([np.linalg.inv(self.getWorld2View2(target_cams[id].R, target_cams[id].T, sc)) for id in ids]))
             virtual_c2ws = torch.from_numpy(np.stack([np.linalg.inv(target_extrs[id]) for id in range(len(target_extrs))]))
+            # posevisual(save_path, train_c2ws, test_c2ws, parallel_poses, vertical_poses, central_poses)
             posevisual(save_path, train_c2ws, test_c2ws, virtual_c2ws)
+            posevisual(save_path1, train_c2ws, test_c2ws)
 
-        return input_imgs, mvs_depths, input_extrs, input_intrs, target_extrs, target_intrs
+        return input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, target_extrs, target_intrs
 
 def create_batches(*tensors: torch.Tensor, batch_size: int):
     return list(zip(*[torch.split(tensor, batch_size) for tensor in tensors]))
@@ -315,28 +403,86 @@ def parallel_trajectory_interpolation(extrinsics):
 
     return np.stack(pseudo_poses, axis=0)
 
-def vertical_trajectory_interpolation(extrinsics):
+def vertical_trajectory_single_direction_interpolation(start_pos, end_pos, z_scale=0.5):
     '''
     known: (a1, a2, a3), (b1, b2, b3), a1c1 + a2c2 + a3c3 = 0, b1c1 + b2c2 + b3c3 = 0, c3=1
     ask: (c1, c2, c3)
     '''
-    poses = np.stack([np.linalg.inv(extrinsics[i]) for i in range(extrinsics.shape[0])]) # c2w, v_num, 4, 4
-
-    start_pos = poses[:-1,...]
-    end_pos = poses[1:,...]
-    a = start_pos[:, :3, 2] # z-axis; v_num-1, 3
+    a = start_pos[:, :3, 2].copy() # z-axis; v_num-1, 3
     b = (end_pos - start_pos)[:, :3, 3] # camera trajectory; v_num-1, 3
     c1 = ((a[:,1]*b[:,2]-a[:,2]*b[:,1]) / (a[:,0]*b[:,1]-a[:,1]*b[:,0] + 1e-5))[...,np.newaxis] # v_num-1, 1
     c2 = ((a[:,2]*b[:,0]-a[:,0]*b[:,2]) / (a[:,0]*b[:,1]-a[:,1]*b[:,0] + 1e-5))[...,np.newaxis] # v_num-1, 1
     c3 = np.ones(c1.shape)
     c = np.concatenate([c1[:,0:1], c2[:,0:1], c3[:,0:1]], -1) # v_num-1, 3
     c = c / np.linalg.norm(c, axis=1)[...,np.newaxis] # v_num-1, 3
+    a = a / np.linalg.norm(a, axis=1)[...,np.newaxis] # v_num-1, 3
 
     pseudo_poses1 = start_pos.copy() # MARK: in-place
-    pseudo_poses1[:, :3, 3] = pseudo_poses1[:, :3, 3] + c * 0.5 # v_num-1, 4, 4
+    pseudo_poses1[:, :3, 3] = pseudo_poses1[:, :3, 3] + a * z_scale + c * 0.5 # v_num-1, 4, 4
 
     pseudo_poses2 = start_pos.copy()
-    pseudo_poses2[:, :3, 3] = pseudo_poses2[:, :3, 3] - c * 0.5 # v_num-1, 4, 4
+    pseudo_poses2[:, :3, 3] = pseudo_poses2[:, :3, 3] + a * z_scale - c * 0.5 # v_num-1, 4, 4
 
     pseudo_poses = np.concatenate([pseudo_poses1[:,:], pseudo_poses2[:,:]], 0) # 2 * (v_num-1), 4, 4
     return pseudo_poses
+
+def central_single_direction_interpolation(start_pos, end_pos, central_poses, z_scale=0.5):
+    
+    '''
+    known: (a1, a2, a3), (b1, b2, b3), a1c1 + a2c2 + a3c3 = 0, b1c1 + b2c2 + b3c3 = 0, c3=1
+    ask: (c1, c2, c3)
+    '''
+    a = start_pos[:, :3, 2].copy() # z-axis; v_num-1, 3
+    b = (end_pos - start_pos)[:, :3, 3] # camera trajectory; v_num-1, 3
+    c1 = ((a[:,1]*b[:,2]-a[:,2]*b[:,1]) / (a[:,0]*b[:,1]-a[:,1]*b[:,0] + 1e-5))[...,np.newaxis] # v_num-1, 1
+    c2 = ((a[:,2]*b[:,0]-a[:,0]*b[:,2]) / (a[:,0]*b[:,1]-a[:,1]*b[:,0] + 1e-5))[...,np.newaxis] # v_num-1, 1
+    c3 = np.ones(c1.shape)
+    c = np.concatenate([c1[:,0:1], c2[:,0:1], c3[:,0:1]], -1) # v_num-1, 3
+    c = c / np.linalg.norm(c, axis=1)[...,np.newaxis] # v_num-1, 3
+    a = a / np.linalg.norm(a, axis=1)[...,np.newaxis] # v_num-1, 3
+
+    pseudo_poses1 = central_poses.copy() # MARK: in-place
+    start_center1 = start_pos[:, :3, 3].copy()
+    pseudo_poses1[:, :3, 3] = start_center1 + b * 0.5 + a * z_scale + c * 0.5 # v_num-1, 4, 4
+
+    pseudo_poses2 = central_poses.copy() # MARK: in-place
+    start_center2 = start_pos[:, :3, 3].copy()
+    pseudo_poses2[:, :3, 3] = start_center2 + b * 0.5 + a * z_scale - c * 0.5 # v_num-1, 4, 4
+
+    pseudo_poses = np.concatenate([pseudo_poses1[:,:], pseudo_poses2[:,:]], 0) # 2 * (v_num-1), 4, 4
+    return pseudo_poses
+
+def vertical_trajectory_interpolation(extrinsics, right=0.5, left=0.5):
+
+    poses = np.stack([np.linalg.inv(extrinsics[i]) for i in range(extrinsics.shape[0])]) # c2w, v_num, 4, 4
+
+    start_pos = poses[:-1,...]
+    end_pos = poses[1:,...]
+    pseudo_poses_right = vertical_trajectory_single_direction_interpolation(start_pos, end_pos, right) # 2 * (v_num-1), 4, 4
+    pseudo_poses_left = vertical_trajectory_single_direction_interpolation(end_pos, start_pos, left) # 2 * (v_num-1), 4, 4
+    pseudo_poses = np.concatenate([pseudo_poses_right[:,:], pseudo_poses_left[:,:]], 0) # 4 * (v_num-1), 4, 4
+
+    # return pseudo_poses
+    return pseudo_poses_right
+
+def central_interpolation(extrinsics, right=0.5, left=0.5):
+
+    poses = np.stack([np.linalg.inv(extrinsics[i]) for i in range(extrinsics.shape[0])]) # c2w, v_num, 4, 4
+
+    start_pos = poses[:-1,...]
+    end_pos = poses[1:,...]
+    mid_pos = (start_pos + end_pos) * 0.5
+
+    pseudo_poses = []
+    for pose in mid_pos:
+        pseudo_pose = np.eye(4, dtype=np.float32)
+        pseudo_pose[:3, :4] = viewmatrix(pose[:3,2], pose[:3,1], pose[:3,3]) # lookdir, up, position
+        pseudo_poses.append(pseudo_pose)
+
+    central_poses =  np.stack(pseudo_poses, axis=0) # v_num-1, 4, 4
+    pseudo_poses_right = central_single_direction_interpolation(start_pos, end_pos, central_poses, right) # 2 * (v_num-1), 4, 4
+    pseudo_poses_left = central_single_direction_interpolation(end_pos, start_pos, central_poses, left) # 2 * (v_num-1), 4, 4
+    central_pseudo_poses = np.concatenate([pseudo_poses_right[:,:], pseudo_poses_left[:,:]], 0) # 4 * (v_num-1), 4, 4
+
+    return central_pseudo_poses
+    # return pseudo_poses_left

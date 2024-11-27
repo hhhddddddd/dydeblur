@@ -5,49 +5,28 @@
 # python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children --eval --iterations 40000
 # python train.py -s data/D_NeRF/trex -m output/dydeblur/D_NeRF/trex -o dynamic --eval --is_blender # D_NeRF
 
-python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o new -e sc_change_camera --eval --iterations 40000
-# python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o new --eval --iterations 40000
-# python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o new --eval --iterations 40000
-# python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o new --eval --iterations 40000
-# python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o new --eval --iterations 40000
-python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o new -e only_sc --eval --iterations 40000
-# python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o new --eval --iterations 40000
-python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o new -e sc_change_camera --eval --iterations 40000
+# python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o new -e only_ssim0.8 -c -1 --eval --iterations 40000
+# python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o new -e only_ssim0.8 -c 0.01 --eval --iterations 40000
+# python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o new -e only_ssim0.8 -c 1.0 --eval --iterations 40000
+# python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o new -e only_ssim0.8 -c 0.1 --eval --iterations 40000
+# python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o new -e only_ssim0.8 --eval -c 0.9 --iterations 40000
+# python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o new -e only_ssim0.8 --eval -c -1 --iterations 40000
+# python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o new -e only_ssim0.8 -c -1 --eval --iterations 40000
+# python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o new -e only_ssim0.8 -c 1.0 --eval --iterations 40000
 
 
-python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o camera --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o camera --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o camera -e virtual_pose_mid --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o new -e only_sc --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o camera --eval --iterations 40000
-python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o camera --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o new -c -1 -e only_mask0.001 --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o new -c -1 -e only_mask0.001 --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o new -c -1 -e only_mask0.001 --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o new -c -1 -e only_mask0.001 --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o new -c -1 -e only_mask0.001 --eval --iterations 40000
+python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o new -c -1 -e only_mask0.001 --eval --iterations 40000
 
 
 # python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e sfm --eval --iterations 40000
 # python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e mvs --eval --iterations 40000
 # python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o point -e random --eval --iterations 40000
 
-'''
-shop: ok                                                                OOM: 90000 gaussian 34246 iter      ok  150000
-dining1: ok                                                             OOM: only 30000 gaussians           ok 100000 
-
-camp: OOM;                                                                                                  127 gaussian
-car: gaussian NaN 3000 iter; only 3 gaussians;                          bad results                         6 gaussian
-dining2: gaussian NaN; only 3 gaussians;                                mideo resuts                        ok 150000
-dock: gaussian NaN 4550 iter; only 3 gaussians                          mideo result                        ok 130000
-gate: gaussian NaN 3000 iter: dynamic nan, mask_loss nan;               over fitting                        ok 260000
-
-mountain: gaussian always unchanged -> zero (3100 iter); ssim is low    grad is xiaoshi                     20 gaussian 
-
-
-basketball:     3000 iter gaussian from 18000 -> 55 (ok)            test ok 30000
-children:       3000 iter gaussian from 50000 -> 15                 test gaussian stop change
-sailor:         ok 3000 iter gaussian from 30000 -> 1000            test ok 100000
-seesaw:         ok 3000 iter gaussian from 110000 -> 30000          test ok 150000 camera_extent is large so gaussian is rise quickly
-skating:        3000 iter gaussian from 65000 -> 1000
-street:         3000 iter gaussian from 57000 -> 0
-
-'''
 
 '''render
 '''
@@ -57,11 +36,16 @@ street:         3000 iter gaussian from 57000 -> 0
 # python render.py -m output/dydeblur/D_NeRF/trex -o dynamic -t 2024-09-19_21:16 --mode render
 # python render.py -m output/dydeblur/D_NeRF/trex -o dynamic -t 2024-09-19_22:06 --mode render
 
-# python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-09-27_08:13 --mode render
-# python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-09-26_23:56 --mode render
-python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-11-07_08:46 --mode render
-# python render.py -m output/dydeblur/D2RF/Dock -o new -t 2024-09-26_23:56 --mode render
-# python render.py -m output/dydeblur/D2RF/Dining2 -o new -t 2024-09-26_23:56 --mode render
+
+# python render.py -m output/dydeblur/D2RF/Camp -o new -t 2024-11-22_22:54 -c -1 --mode render # 0.1
+# python render.py -m output/dydeblur/D2RF/Car -o new -t 2024-11-22_22:48 -c 0.01 --mode render # 0.1
+# python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-11-23_13:42 -c 1.0 --mode render # 0.9
+# python render.py -m output/dydeblur/D2RF/Dining2 -o new -t 2024-11-22_22:27 -c 0.1 --mode render # true 0.1
+# python render.py -m output/dydeblur/D2RF/Dock -o new -t 2024-11-22_22:49 -c 0.9 --mode render # 1.0
+# python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-11-22_22:34 -c -1 --mode render # 0.1
+# python render.py -m output/dydeblur/D2RF/Mountain -o new -t 2024-11-22_22:35 -c -1 --mode render # 0.1
+# python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-11-22_22:37 -c 1.0 --mode render # 1.0
+
 
 # python render.py -m output/dydeblur/DyBluRF/sailor -o test -t 2024-09-28_23:10 --mode render 
 # python render.py -m output/dydeblur/DyBluRF/basketball -o test -t 2024-09-29_11:22 --mode render 
@@ -73,9 +57,16 @@ python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-11-07_08:46 --mode 
 
 # python metrics.py -m output/dydeblur/D_NeRF/trex 
 
+
+# python metrics.py -m output/dydeblur/D2RF/Camp
+# python metrics.py -m output/dydeblur/D2RF/Car
 # python metrics.py -m output/dydeblur/D2RF/Dining1
-# python metrics.py -m output/dydeblur/D2RF/Shop
+# python metrics.py -m output/dydeblur/D2RF/Dining2
+# python metrics.py -m output/dydeblur/D2RF/Dock
 # python metrics.py -m output/dydeblur/D2RF/Gate
+# python metrics.py -m output/dydeblur/D2RF/Mountain
+# python metrics.py -m output/dydeblur/D2RF/Shop
+
 
 # python metrics.py -m output/dydeblur/DyBluRF/sailor 
 # python metrics.py -m output/dydeblur/DyBluRF/basketball 

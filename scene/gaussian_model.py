@@ -28,7 +28,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-            actual_covariance = L @ L.transpose(1, 2)
+            actual_covariance = L @ L.transpose(1, 2) # RS(RS)^T
             symm = strip_symmetric(actual_covariance) # Only the upper triangle of symmetric matrix
             return symm
 
@@ -114,7 +114,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)  # torch.Size([100000])
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
-        rots[:, 0] = 1
+        rots[:, 0] = 1 # NOTE don't understand
         dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
@@ -152,6 +152,12 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
+
+        # self.scale_scheduler_args = get_expon_lr_func(lr_init=training_args.scaling_lr * self.spatial_lr_scale,
+        #                                             lr_final=0.00001 * self.spatial_lr_scale,
+        #                                             lr_delay_mult=training_args.position_lr_delay_mult,
+        #                                             max_steps=training_args.position_lr_max_steps)
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
@@ -159,6 +165,11 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
+            # if param_group["name"] == "scaling":
+            #     lr = self.scale_scheduler_args(iteration)
+            #     param_group['lr'] = lr
+            #     return lr
+
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
