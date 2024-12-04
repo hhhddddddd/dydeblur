@@ -195,9 +195,11 @@ def safe_state(silent): # print function
 
     sys.stdout = F(silent)
 
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
+    seed = 0
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.set_device(torch.device("cuda:0"))
 
 def Pseudocolorization(depth):

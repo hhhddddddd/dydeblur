@@ -38,7 +38,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths, model, use_model=True):
+def evaluate(model_paths, source_paths, model, use_model=True):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -53,6 +53,13 @@ def evaluate(model_paths, model, use_model=True):
         full_dict_polytopeonly[scene_dir] = {} # useless
         per_view_dict_polytopeonly[scene_dir] = {} # useless
 
+        motion_mask_dir = Path(source_paths[0]) / "motion_masks"
+        masks = []
+        for fname in sorted(os.listdir(motion_mask_dir)):
+            if fname.split('_')[-1] == "left.png":
+                continue
+            mask = Image.open(os.path.join(motion_mask_dir, fname)) # 1, 1, 400, 940
+            masks.append(tf.to_tensor(mask).unsqueeze(0).cuda())       
         test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test) MARK: train / test
         # test_dir = Path(scene_dir) / "train" # PosixPath('output/D_NeRF/trex/train)
 
@@ -75,15 +82,28 @@ def evaluate(model_paths, model, use_model=True):
             psnrs = []
             lpipss = []
 
-            for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                ssims.append(ssim(renders[idx], gts[idx]))
-                psnrs.append(psnr(renders[idx], gts[idx]))
-                if use_model:
-                    with torch.no_grad():
-                        lpips_value = model.forward(gts[idx], renders[idx])
-                        lpipss.append(lpips_value.item())
-                else:
-                    lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+            use_mask = True
+            # use_mask = False
+            if use_mask:
+                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    ssims.append(ssim(renders[idx], gts[idx], masks[idx]))
+                    psnrs.append(psnr(renders[idx], gts[idx], masks[idx]))
+                    if use_model:
+                        with torch.no_grad():
+                            lpips_value = model.forward(renders[idx], gts[idx], masks[idx])
+                            lpipss.append(lpips_value.item())
+                    else:
+                        lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+            else:
+                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    ssims.append(ssim(renders[idx], gts[idx]))
+                    psnrs.append(psnr(renders[idx], gts[idx]))
+                    if use_model:
+                        with torch.no_grad():
+                            lpips_value = model.forward(renders[idx], gts[idx])
+                            lpipss.append(lpips_value.item())
+                    else:
+                        lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
 
             print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
             print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
@@ -114,8 +134,9 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument('--source_paths', '-s', required=True, nargs="+", type=str, default=[])
     args = parser.parse_args()
 
     with torch.no_grad():
         model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1)
-    evaluate(args.model_paths, model, use_model=True)
+    evaluate(args.model_paths, args.source_paths, model, use_model=True)

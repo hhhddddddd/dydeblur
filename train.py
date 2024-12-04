@@ -232,6 +232,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             rgb = torch.sum(patches * kernel_weights, 2)[0] # 3, 400, 940
             mask = mask[0] # 1, 400, 940
             image = mask*rgb + (1-mask)*image
+            # image = rgb
 
             maskloss = opt.mask_loss_alpha * mask.mean() if (opt.use_mask_loss and (iteration > 0)) else 0
             center = align_loss_center(iteration, init=1.0, final=0.5)
@@ -286,7 +287,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             # Log and save
             cur_psnr_test, cur_psnr_train, cur_psnr_virtual, cur_ssim_test, cur_lpips_test = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
                                        testing_iterations, scene, render, blur, (pipe, background), deform,
-                                       dataset.load2gpu_on_the_fly, dataset.is_6dof, dataset, opt, lpips_fn, model, use_model=True)
+                                       dataset.load2gpu_on_the_fly, dataset.is_6dof, dataset, opt, lpips_fn, model, use_model=dataset.use_alex)
             if iteration in testing_iterations: # best_psnr_test only aims to testing_iterations
                 if cur_psnr_test.item() > best_psnr_test:
                     best_psnr_test = cur_psnr_test.item()
@@ -315,7 +316,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 10e9 if iteration > opt.opacity_reset_interval else None # set size_threshold
-                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, iteration)
+                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, 10, size_threshold, iteration) # scene.cameras_extent
                     gs_num['iteration'] = iteration
                     gs_texts.append(gs_num)
                     # print(iteration, gaussians.get_xyz.shape[0])
@@ -343,6 +344,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             if iteration < opt.iterations: # Termination iteration
                 if iteration > 3500:
                     blur.optimizer.step()
+                    # blur.update_learning_rate(iteration)
                     blur.optimizer.zero_grad()
                 
                 gaussians.optimizer.step()
@@ -371,10 +373,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         json.dump(loss_texts, file, indent=4)
 
     result = {}
-    result['scene'], result['experiment'] = scene_name, dataset.experiment
+    result['scene'], result['experiment'] = scene_name, starttime[5:16] + '_' + dataset.experiment
     result['PSNR'], result['SSIM'], result['LPIPS'] = best_psnr_test, best_ssim_test, best_lpips_test
     result['Iteration'], result['gs_num'] = best_iteration_test, gaussians.get_xyz.shape[0]
-    results_path = os.path.join("/home/xuankai/code/d-3dgs/output/dydeblur/results.json")
+    current_file_path = os.path.abspath(__file__)
+    results_path = os.path.join(current_file_path.split('/train')[0] , "output/dydeblur/results.json")
     with open(results_path, 'r+') as file:
         results = json.load(file)
         results.append(result)
@@ -485,6 +488,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             rgb = torch.sum(patches * kernel_weights, 2)[0]
                             mask = mask[0] # 1, 400, 940
                             image = mask*rgb + (1-mask)*sharp_image
+                            # image = rgb
 
                             masks = torch.cat((masks, mask.mean().unsqueeze(0)), dim=0) # mask; 1, 1
                             motion_masks = torch.cat((motion_masks, motion_mask.unsqueeze(0)), dim=0) # motion_mask; 1, 1, 400, 940
@@ -518,8 +522,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
                             tb_writer.add_images(config['name'] + "_view_{}/sharp".format(viewpoint.image_name),
                                              sharp_image[None], global_step=iteration)
-                            tb_writer.add_images(config['name'] + "_view_{}/blur_map".format(viewpoint.image_name),
-                                             mask, global_step=iteration, dataformats='CHW')
+                            if iteration > 3500:
+                                tb_writer.add_images(config['name'] + "_view_{}/blur_map".format(viewpoint.image_name),
+                                                mask, global_step=iteration, dataformats='CHW')
                                                    
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
@@ -545,7 +550,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         ssims.append(ssim(images[idx].unsqueeze(0), gts[idx].unsqueeze(0))) # 1, 3, 400, 940
                         if use_model:
                             with torch.no_grad():
-                                lpips_value = model.forward(gts[idx].unsqueeze(0), images[idx].unsqueeze(0))
+                                lpips_value = model.forward(images[idx].unsqueeze(0), gts[idx].unsqueeze(0))
                                 lpipss.append(lpips_value.item())
                         else:
                             lpipss.append(lpips_fn(images[idx].unsqueeze(0), gts[idx].unsqueeze(0)).detach())
@@ -605,9 +610,9 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=[5000, 6000, 7000] + list(range(7000, 40001, 1000)))
+                        default=[5000, 6000] + list(range(7000, 40001, 1000)))
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[3000, 3101, 20000, 40000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[20000, 40000])
     parser.add_argument("--clean_iterations", nargs="+", type=int, default=list(range(10000, 25001, 5000)))
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])          # Namespace

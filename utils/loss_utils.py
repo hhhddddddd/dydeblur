@@ -81,7 +81,8 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True, mask=None
         if mask is None:
             return ssim_map.mean()
         else:
-            return (ssim_map * mask).mean()
+            num_valid = mask.sum() * img1.shape[1]
+            return (ssim_map * mask).sum() / num_valid
     else:
         return ssim_map.mean(1).mean(1).mean(1)
     

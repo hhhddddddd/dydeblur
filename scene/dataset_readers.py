@@ -1003,9 +1003,9 @@ def readDyBluRFCameras(path, camera_scale=-1):
 
     return cam_infos, sc
 
-def readDyBluRFDataset(path, eval = True, llffhold = 2):
+def readDyBluRFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
-    cam_infos_unsorted, sc = readDyBluRFCameras(path)
+    cam_infos_unsorted, sc = readDyBluRFCameras(path, camera_scale)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if eval: # divide the training set and test set

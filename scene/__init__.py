@@ -82,7 +82,7 @@ class Scene:
 
         elif os.path.exists(os.path.join(args.source_path, "sharp_images")):
             print("Found sharp_images, assuming DyBluRF data set!")
-            scene_info = sceneLoadTypeCallbacks["DyBluRF"](args.source_path) # DyBluRF
+            scene_info = sceneLoadTypeCallbacks["DyBluRF"](args.source_path, args.camera_scale) # DyBluRF
 
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             print("Found calibration_full.json, assuming Neu3D data set!")

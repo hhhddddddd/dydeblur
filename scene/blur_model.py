@@ -23,6 +23,7 @@ import os
 import torch
 from torch import nn
 from utils.system_utils import searchForMaxIteration
+from utils.general_utils import get_expon_lr_func
 
 class Blur(nn.Module):
     def __init__(self, num_img, H=400, W=600, img_embed=32, ks=17, not_use_rgbd=False,not_use_pe=False):
@@ -88,11 +89,19 @@ class Blur(nn.Module):
                         list(self.mlp_base_mlp.parameters()) +
                         list(self.mlp_head1.parameters()) + 
                         list(self.mlp_mask1.parameters()),
-             'lr': 5e-4}
+             'lr': 5e-4, "name": "blur"}
         ]
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
+        self.blur_scheduler_args = get_expon_lr_func(lr_init=5e-4, lr_final=1e-5, lr_delay_mult=0.01, max_steps=35000)
 
+    def update_learning_rate(self, iteration):
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] == "blur":
+                lr = self.blur_scheduler_args(iteration)
+                param_group['lr'] = lr
+                return lr
+   
     def save_weights(self, model_path, iteration, starttime, operate, best=False):   
         if not best:
             out_weights_path = os.path.join(model_path, operate, starttime[:16], "blur/iteration_{}".format(iteration))

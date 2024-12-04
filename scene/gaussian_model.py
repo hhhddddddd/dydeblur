@@ -441,7 +441,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         gs_num['split'] =  str(split)+'->'+str(self.get_xyz.shape[0])
 
         # prune
-        prune_mask = (self.get_opacity < min_opacity).squeeze() # min_opacity == 0.05
+        prune_mask = (self.get_opacity < min_opacity).squeeze() # min_opacity == 0.005
         gs_num['opacity_prune'] = str(prune_mask.sum().cpu().item())
         gs_num['radii2D'] = torch.all(self.max_radii2D == 0).cpu().item()
         print('mean=',self.max_radii2D.mean())

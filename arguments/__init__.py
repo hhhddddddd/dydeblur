@@ -65,6 +65,7 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
+        self.use_alex = True # lpips
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -109,16 +110,16 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.lambda_s=0.01
         self.lambda_p=0.01
 
-        self.virtual_lambda_dssim = 0.8
+        self.virtual_lambda_dssim = 0.2
 
-        self.use_mask_loss = True    # mask
+        self.use_mask_loss = False    # mask
         self.mask_loss_alpha = 0.001    # 0.001
-        self.use_align_loss = False    # align
+        self.use_align_loss = True    # align
         self.align_loss_alpha = 0.001   # 0.001
         self.use_rgbtv_loss = False    # rgbtv
         self.rgbtv_loss_alpha = 0.1     # 0.001  
         self.use_depth_loss = False     # depth
-        self.depth_loss_alpha = 0.001   # 0.001 
+        self.depth_loss_alpha = 0.1   # 0.001 
         
         super().__init__(parser, "Optimization Parameters")
 

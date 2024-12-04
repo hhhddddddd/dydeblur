@@ -183,11 +183,19 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 #     print(scene, "z-distance mean:", distance_mean)
 ######################## train test camera distance ########################
 
-kernel_weights = torch.rand(1, 81, 400, 940)
-kernel = 9
-kernel_center = kernel_weights[:, ((kernel * kernel) // 2), :, :].cuda() # batch, 400, 940
-target = (torch.ones(kernel_weights.shape[0], kernel_weights.shape[-2], kernel_weights.shape[-1]) * 1.).cuda() # batch, 400, 940
-alignloss = (target - kernel_center).abs().mean() # batch, 400, 940 -> torch.Size([])
+path = "/home/xuankai/LSM/D2RF/"
+# path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+for scene in sorted(os.listdir(path)):
+
+    point_path = path + scene + "/point_cloud.ply"
+    # point_path = path + scene + "/dense/sparse_/points3D.ply"
+    
+    plydata = PlyData.read(point_path)
+    vertices = plydata['vertex']
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+
+    print(scene, "pcd_max:", positions.max(0))
+    print(scene, "pcd_min:", positions.min(0))
 
 
 
