@@ -183,19 +183,32 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 #     print(scene, "z-distance mean:", distance_mean)
 ######################## train test camera distance ########################
 
-path = "/home/xuankai/LSM/D2RF/"
-# path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
-for scene in sorted(os.listdir(path)):
+######################## Bilinear Interpolation ########################
+# import numpy as np
+# from scipy.interpolate import RegularGridInterpolator
 
-    point_path = path + scene + "/point_cloud.ply"
-    # point_path = path + scene + "/dense/sparse_/points3D.ply"
-    
-    plydata = PlyData.read(point_path)
-    vertices = plydata['vertex']
-    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+# x = np.linspace(0,1,10)
+# y = np.linspace(0,1,10)
+# z = np.random.rand(10,10)
 
-    print(scene, "pcd_max:", positions.max(0))
-    print(scene, "pcd_min:", positions.min(0))
+# interp_func = RegularGridInterpolator((x,y),z)
+
+# points = np.array([[0.2,0.4],[0.6,0.8]]) # 2,2
+# interp_values = interp_func(points) # 2,
+# print(interp_values)
+######################## Bilinear Interpolation ########################
+
+path = "/home/xuankai/code/dydeblur/data/D2RF/Dock"
+depth_path = sorted(os.listdir(os.path.join(path,"dpt")))
 
 
-
+xyz_worlds = np.empty((0, 3))
+images = np.empty((0, 3))
+for i in range(len(depth_path)):
+    if i % 2 == 1:
+        continue
+    disparity = np.load(os.path.join(path, "dpt", depth_path[i])) # 400, 940
+    disparity = disparity - disparity.min()
+    disparity = disparity / disparity.max()
+    cv2.imwrite("/home/xuankai/code/disparity.png",disparity*255)
+    print("ok")

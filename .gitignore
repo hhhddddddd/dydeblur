@@ -9,6 +9,7 @@ screenshots
 .ideas
 data
 assets
-models
 pretrained
 *.md
+scripts.sh
+scriptss.sh

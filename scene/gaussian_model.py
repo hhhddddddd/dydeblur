@@ -133,8 +133,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # self.denom: self.denominator
 
-        self.spatial_lr_scale = 5. # FIXME
-        print("Gaussian cameras_extent =", self.spatial_lr_scale)
+        # self.spatial_lr_scale = 5. # FIXME
+        print("Gaussian Cameras Extent =", self.spatial_lr_scale)
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -444,9 +444,10 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         prune_mask = (self.get_opacity < min_opacity).squeeze() # min_opacity == 0.005
         gs_num['opacity_prune'] = str(prune_mask.sum().cpu().item())
         gs_num['radii2D'] = torch.all(self.max_radii2D == 0).cpu().item()
-        print('mean=',self.max_radii2D.mean())
-        print('max=',self.max_radii2D.max())
-        print('min=',self.max_radii2D.min())
+        print('max_radii2D: Mean={:.2f}, Max={:.2f}, Min={:.2f}'.format(self.max_radii2D.mean().item(), self.max_radii2D.max().item(), self.max_radii2D.min().item()))
+        print('get_scale_x: Mean={:.2f}, Max={:.2f}, Min={:.2f}'.format(self.get_scaling[:,0].mean().item(), self.get_scaling[:,0].max().item(), self.get_scaling[:,0].min().item()))
+        print('get_scale_y: Mean={:.2f}, Max={:.2f}, Min={:.2f}'.format(self.get_scaling[:,1].mean().item(), self.get_scaling[:,1].max().item(), self.get_scaling[:,1].min().item()))
+        print('get_scale_z: Mean={:.2f}, Max={:.2f}, Min={:.2f}'.format(self.get_scaling[:,2].mean().item(), self.get_scaling[:,2].max().item(), self.get_scaling[:,2].min().item()))
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size                  # big points view sapce, strange: self.max_radii2D is always zero?
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent   # big points world space

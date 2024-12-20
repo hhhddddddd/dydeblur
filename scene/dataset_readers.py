@@ -184,7 +184,7 @@ def fetchPly(path, sc=1.): # fetch points
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     positions *= sc
     colors = np.vstack([vertices['red'], vertices['green'],
-                       vertices['blue']]).T / 255.0
+                       vertices['blue']]).T / 255.0 # NOTE 255 in .ply, raw rgb is zero!
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
@@ -791,90 +791,17 @@ def readD2RFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
  
-    depth_point = False
-    # depth_point =True
+    # depth_point = False
+    depth_point =True
     if depth_point:
-        ply_path = os.path.join(path, "depth.ply")
-        # if not os.path.exists(ply_path): # NOTE first-frame depth point
-        image_path = sorted(os.listdir(os.path.join(path,"images_2")))[0]
-        depth_path = sorted(os.listdir(os.path.join(path,"dpt")))[0]
-        pose_path = os.path.join(path,"poses_bounds.npy")
-
-        image = Image.open(os.path.join(path, "images_2", image_path))
-        image = np.array(image).reshape(-1, 3) # 360, 940, 3 -> 360 * 940, 3
-        depth = np.load(os.path.join(path, "dpt", depth_path)).reshape(-1, 1) # 360 * 940, 1
-        depth = (depth.max() + depth.min()) - depth # inverse depth -> depth
-        pose = np.load(pose_path)[:, :-2].reshape([-1, 3, 5])[0] # 3, 5
-
-        height, width, focal = pose[:, 4] / 2
-        c2w = pose[:3, :4]
-        c2w = np.concatenate([c2w[:, 0:1], -c2w[:, 1:2], -c2w[:, 2:3], c2w[:, 3:4]], 1) # llff (DRB) -> colmap (RDF)
-        xs, ys = np.meshgrid(np.arange(width), np.arange(height)) # 360, 940
-        xs, ys = xs.reshape(-1, 1), ys.reshape(-1, 1) # 360 * 940, 1
-
-        xs = depth * (xs - (width/2)) / focal
-        ys = depth * (ys - (height/2)) / focal  
-        xyz_cam = np.stack((xs, ys, depth), -1) # 360 * 940, 1, 3
-        xyz_cam = np.squeeze(xyz_cam, axis=1) # 360 * 940, 3
-        xyz_world = xyz_cam.astype(np.float64) @ c2w[:3, :3].T + c2w[:3, 3:4].reshape((1, 3)) # 360 * 940, 3
-        
-        # point cloud alignment manually
-        # xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
-        # xyz_center = (xyz_max + xyz_min) * 0.5
-        # affinemat = np.eye(4) # Affine transformation matrix
-        # affinemat[0, -1], affinemat[1, -1], affinemat[2, -1] = -xyz_center[0], -xyz_center[1], -xyz_min[2] + 1000.
-        # ones = np.ones(xyz_world.shape[0])[:, np.newaxis]
-        # xyz_world = np.concatenate([xyz_world, ones], -1) # Homogeneous coordinates
-        # xyz_world = xyz_world @ affinemat.T
-        # xyz_world = xyz_world[:, :-1] * 0.001 # scale
-
-        # depth_point remove extrem outliers
-        remove_outliers = True
-        if remove_outliers:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(xyz_world)
-            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.) # larger std_ratio, more point
-            image = image[ind]
-            xyz_world = np.array(pcd.points)
-
-        # point cloud alignment sfm
-        ply_sfm_path = os.path.join(path, "sparse_/0/points3D.ply")
-        ply_sfm_data = PlyData.read(ply_sfm_path)
-        vertices = ply_sfm_data['vertex']
-        points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-
-        # sfm_point remove extrem outliers
-        remove_outliers = True
-        if remove_outliers:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points)
-            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.75)
-            points = np.array(pcd.points)
-
-        pcd_sfm_max, pcd_sfm_min = points.max(0), points.min(0) # points: n_points, 3
-        dist_sfm_max = pcd_sfm_max - pcd_sfm_min
-
-        xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
-        xyz_range = xyz_max - xyz_min
-
-        points = (xyz_world - xyz_min) / xyz_range
-        xyz_world = points * dist_sfm_max * 1.1 + pcd_sfm_min * 1.1
-
-        # Farthest Point Sampling
-        FSP = True
-        if FSP:
-            print('Start Farthest Point Sampling ...')
-            random_idx = farthest_point_sample(torch.tensor(xyz_world[np.newaxis,...]).cuda(), 100_000).squeeze(0).cpu().numpy()
-            print('End Farthest Point Sampling! ')
-            xyz_world = xyz_world[random_idx]
-            image = image[random_idx]
-
-        storePly(ply_path, xyz_world, image)
+        print("depth point!")
+        ply_path = os.path.join(path, "depth_rgb_True.ply")
         try:
             pcd = fetchPly(ply_path)
         except:
             pcd = None
     else:
+        print("sfm point!")
         ply_path = os.path.join(path, "sparse_/0/points3D.ply")
         bin_path = os.path.join(path, "sparse_/0/points3D.bin")
         txt_path = os.path.join(path, "sparse_/0/points3D.txt")
@@ -1022,91 +949,14 @@ def readDyBluRFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
     depth_point = False
     # depth_point =True
     if depth_point:
-        ply_path = os.path.join(path, "depth.ply")
-        # if not os.path.exists(ply_path): # NOTE first-frame depth point
-        image_path = sorted(os.listdir(os.path.join(path,"images_512x288")))[0]
-        depth_path = sorted(os.listdir(os.path.join(path,"disp")))[0]
-        pose_path = os.path.join(path,"poses_bounds.npy")
-
-        image = Image.open(os.path.join(path, "images_512x288", image_path))
-        image = np.array(image).reshape(-1, 3) # 360, 940, 3 -> 360 * 940, 3
-        # depth = np.load(os.path.join(path, "disp", depth_path)).reshape(-1, 1) # 360 * 940, 1
-        depth = np.load(os.path.join(path, "disp", depth_path)) # sailor: 384, 672; strange ???
-        depth = cv.resize(depth, (512, 288), interpolation=cv.INTER_NEAREST).reshape(-1, 1)
-        depth = (depth.max() + depth.min()) - depth # inverse depth -> depth
-        pose = np.load(pose_path)[:, :-2].reshape([-1, 3, 5])[0] # 3, 5
-
-        height, width, focal = pose[:, 4] / 2.5 # height = 282.8, weight = 503.6, focal = 276.22
-        height = 288
-        width = 512
-        c2w = pose[:3, :4]
-        c2w = np.concatenate([c2w[:, 0:1], -c2w[:, 1:2], -c2w[:, 2:3], c2w[:, 3:4]], 1) # llff (DRB) -> colmap (RDF)
-        xs, ys = np.meshgrid(np.arange(width), np.arange(height)) # 360, 940
-        xs, ys = xs.reshape(-1, 1), ys.reshape(-1, 1) # 360 * 940, 1
-
-        xs = depth * (xs - (width/2)) / focal
-        ys = depth * (ys - (height/2)) / focal  
-        xyz_cam = np.stack((xs, ys, depth), -1) # 360 * 940, 1, 3
-        xyz_cam = np.squeeze(xyz_cam, axis=1) # 360 * 940, 3
-        xyz_world = xyz_cam.astype(np.float64) @ c2w[:3, :3].T + c2w[:3, 3:4].reshape((1, 3)) # 360 * 940, 3
-        
-        # point cloud alignment manually
-        # xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
-        # xyz_center = (xyz_max + xyz_min) * 0.5
-        # affinemat = np.eye(4) # Affine transformation matrix
-        # affinemat[0, -1], affinemat[1, -1], affinemat[2, -1] = -xyz_center[0], -xyz_center[1], -xyz_min[2] + 1000.
-        # ones = np.ones(xyz_world.shape[0])[:, np.newaxis]
-        # xyz_world = np.concatenate([xyz_world, ones], -1) # Homogeneous coordinates
-        # xyz_world = xyz_world @ affinemat.T
-        # xyz_world = xyz_world[:, :-1] * 0.001 # scale
-
-        # depth_point remove extrem outliers
-        remove_outliers = True
-        if remove_outliers:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(xyz_world)
-            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.) # larger std_ratio, more point
-            image = image[ind]
-            xyz_world = np.array(pcd.points)
-
-        # point cloud alignment sfm
-        ply_sfm_path = os.path.join(path, "sparse_/points3D.ply")
-        ply_sfm_data = PlyData.read(ply_sfm_path)
-        vertices = ply_sfm_data['vertex']
-        points = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-
-        # sfm_point remove extrem outliers
-        remove_outliers = True
-        if remove_outliers:
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points)
-            pcd, ind = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=0.75)
-            points = np.array(pcd.points)
-
-        pcd_sfm_max, pcd_sfm_min = points.max(0), points.min(0) # points: n_points, 3
-        dist_sfm_max = pcd_sfm_max - pcd_sfm_min
-
-        xyz_max, xyz_min = xyz_world.max(0), xyz_world.min(0)
-        xyz_range = xyz_max - xyz_min
-
-        points = (xyz_world - xyz_min) / xyz_range
-        xyz_world = points * dist_sfm_max * 1.1 + pcd_sfm_min * 1.1
-
-        # Farthest Point Sampling
-        FSP = True
-        if FSP:
-            print('Start Farthest Point Sampling ...')
-            random_idx = farthest_point_sample(torch.tensor(xyz_world[np.newaxis,...]).cuda(), 100_000).squeeze(0).cpu().numpy()
-            print('End Farthest Point Sampling! ')
-            xyz_world = xyz_world[random_idx]
-            image = image[random_idx]
-
-        storePly(ply_path, xyz_world, image)
+        print("depth point!")
+        ply_path = os.path.join(path, "depth_rgb_True.ply")
         try:
             pcd = fetchPly(ply_path)
         except:
             pcd = None
     else:
+        print("sfm point!")
         ply_path = os.path.join(path, "sparse_/points3D.ply") # NOTE sfm point cloud
         bin_path = os.path.join(path, "sparse_/points3D.bin")
         txt_path = os.path.join(path, "sparse_/points3D.txt")

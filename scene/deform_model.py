@@ -8,13 +8,13 @@ from utils.general_utils import get_expon_lr_func
 
 
 class DeformModel:
-    def __init__(self, is_blender=False, is_6dof=False, spatial_lr_scale=5):
+    def __init__(self, is_blender=False, is_6dof=False, spatial_lr_scale=5.):
         self.deform = DeformNetwork(is_blender=is_blender, is_6dof=is_6dof).cuda() # MARK: cuda
         self.optimizer = None
         # self.spatial_lr_scale = 0.5
-        self.spatial_lr_scale = 5.0
-        # self.spatial_lr_scale = spatial_lr_scale   # scale factor: Adjusts the learning rate scaling for different spatial locations
-        print('DeforModel cameras_extent =', self.spatial_lr_scale) # FIXME 
+        # self.spatial_lr_scale = 5.0
+        self.spatial_lr_scale = spatial_lr_scale   # scale factor: Adjusts the learning rate scaling for different spatial locations
+        print('DeforModel Cameras Extent =', self.spatial_lr_scale) # FIXME 
 
     def step(self, xyz, time_emb):
         return self.deform(xyz, time_emb) # DeformNetwork.forward

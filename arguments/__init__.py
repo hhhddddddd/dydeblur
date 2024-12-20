@@ -65,7 +65,9 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
-        self.use_alex = True # lpips
+        self.not_use_gt_rgbd = True
+        self._gaussian_spatial_lr_scale = 5.0
+        self._jdeform_spatial_lr_scale = 5.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -85,12 +87,15 @@ class PipelineParams(ParamGroup): # PipelineParams inherits ParamGroup
 class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
     def __init__(self, parser):
         self.iterations = 40_000
-        self.warm_up = 3_000
+        self.warm_up = 3_000 # 3000
+        self.blur_iteration = 3_500 # 3500
+        self.virtual_interval = 5 # 5
         self.position_lr_init = 0.00016 # 0.00016
         self.position_lr_final = 0.0000016 # 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
         self.deform_lr_max_steps = 40_000
+        self.virtual_max_steps = 40_000 # 40_000
         self.dynamic_lr_max_steps = 40_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
@@ -103,7 +108,9 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000 # 15_000
-        self.densify_grad_threshold = 0.0002
+        self._densify_grad_threshold = 0.0002 # 0.0002
+        self._for_min_opacity = 0.005 # 0.005
+        self._prune_cameras_extent = 7.5
 
         self.gtnet_lr = 1e-3
         self.max_clamp = 1.1
@@ -112,10 +119,13 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
 
         self.virtual_lambda_dssim = 0.2
 
-        self.use_mask_loss = False    # mask
-        self.mask_loss_alpha = 0.001    # 0.001
+        self.use_mask_loss = True    # mask
+        self._zmask_loss_alpha = 0.001    # 0.001
+        self.use_mask_sparse_loss = False    # mask
+        self.mask_sparse_loss_alpha = 0.001    # 0.001
         self.use_align_loss = True    # align
-        self.align_loss_alpha = 0.001   # 0.001
+        self._align_loss_alpha = 0.001   # 0.001
+        self.align_loss_iteration = 5500   # 0.001
         self.use_rgbtv_loss = False    # rgbtv
         self.rgbtv_loss_alpha = 0.1     # 0.001  
         self.use_depth_loss = False     # depth

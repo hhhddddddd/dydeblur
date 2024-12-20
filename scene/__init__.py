@@ -106,7 +106,7 @@ class Scene:
 
 
         self.cameras_extent = scene_info.nerf_normalization["radius"] # cameras_extent: the max distance between mean_camera_center and camera 
-        print('First cameras_extent =', self.cameras_extent)
+        print('Real Cameras Extent =', self.cameras_extent)
         for resolution_scale in resolution_scales:  # CameraInfo -> Camera; MARK: resize image
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
@@ -140,7 +140,7 @@ class Scene:
                                                  "point_cloud.ply"),
                                     og_number_points=len(scene_info.point_cloud.points))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, args.gaussian_spatial_lr_scale) # self.cameras_extent
 
     def save(self, iteration, starttime, operate, best=False):
         if not best:

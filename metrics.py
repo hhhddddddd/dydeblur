@@ -38,7 +38,7 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths, source_paths, model, use_model=True):
+def evaluate(model_paths, source_paths, model, use_alex=True):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
@@ -82,13 +82,13 @@ def evaluate(model_paths, source_paths, model, use_model=True):
             psnrs = []
             lpipss = []
 
-            use_mask = True
-            # use_mask = False
+            # use_mask = True # MARK: dynamic region 
+            use_mask = False
             if use_mask:
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
                     ssims.append(ssim(renders[idx], gts[idx], masks[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx], masks[idx]))
-                    if use_model:
+                    if use_alex:
                         with torch.no_grad():
                             lpips_value = model.forward(renders[idx], gts[idx], masks[idx])
                             lpipss.append(lpips_value.item())
@@ -98,7 +98,7 @@ def evaluate(model_paths, source_paths, model, use_model=True):
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
                     ssims.append(ssim(renders[idx], gts[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx]))
-                    if use_model:
+                    if use_alex:
                         with torch.no_grad():
                             lpips_value = model.forward(renders[idx], gts[idx])
                             lpipss.append(lpips_value.item())
@@ -135,8 +135,9 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
     parser.add_argument('--source_paths', '-s', required=True, nargs="+", type=str, default=[])
+    parser.add_argument('--use_alex', action="store_true")
     args = parser.parse_args()
-
+    print("use_alex:",args.use_alex)
     with torch.no_grad():
         model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1)
-    evaluate(args.model_paths, args.source_paths, model, use_model=True)
+    evaluate(args.model_paths, args.source_paths, model, use_alex=args.use_alex) # MARK: model

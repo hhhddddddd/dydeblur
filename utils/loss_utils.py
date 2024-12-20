@@ -162,7 +162,7 @@ def tv_loss(grids, mask=None): # grids.shape: batch, channel, height, width
 
 def align_loss(kernel_weights, kernel, center=1.0): # batch, kernel*kernel, 400, 940
     kernel_center = kernel_weights[:, ((kernel * kernel) // 2), :, :] # batch, 400, 940
-    target = (torch.ones(kernel_weights.shape[0], kernel_weights.shape[-2], kernel_weights.shape[-1]) * center).cuda() # batch, 400, 940
+    target = (torch.ones(kernel_weights.shape[0], kernel_weights.shape[-2], kernel_weights.shape[-1]) * center.cpu()).cuda() # batch, 400, 940
     alignloss = (target - kernel_center).abs().mean() # batch, 400, 940 -> torch.Size([])
     return alignloss
 
