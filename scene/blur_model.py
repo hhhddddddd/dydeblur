@@ -26,7 +26,7 @@ from utils.system_utils import searchForMaxIteration
 from utils.general_utils import get_expon_lr_func
 
 class Blur(nn.Module):
-    def __init__(self, num_img, H=400, W=600, img_embed=32, ks=17, not_use_rgbd=False, not_use_pe=False, not_use_gt_rgbd=True, skip_connect=True):
+    def __init__(self, num_img, H=400, W=600, img_embed=32, ks=17, not_use_rgbd=False, not_use_pe=False, not_use_dynamic_mask=True, skip_connect=True):
         super().__init__()
         self.num_img = num_img
         self.W, self.H = W, H
@@ -41,7 +41,7 @@ class Blur(nn.Module):
         
         self.not_use_rgbd = not_use_rgbd
         self.not_use_pe = not_use_pe
-        self.not_use_gt_rgbd = not_use_gt_rgbd
+        self.not_use_dynamic_mask = not_use_dynamic_mask
         self.skip_connect = skip_connect
         print('single res: not_use_rgbd', self.not_use_rgbd, 'not_use_pe', self.not_use_pe)
         rgd_dim = 0 if self.not_use_rgbd else 32
@@ -52,24 +52,27 @@ class Blur(nn.Module):
             torch.nn.Conv2d(64, 64, 1, bias=False), torch.nn.ReLU(),
             )
         
-        self.mlp_head1 = torch.nn.Conv2d(64, ks**2, 1, bias=False)
+        # self.mlp_head1 = torch.nn.Conv2d(64, ks**2, 1, bias=False) # NOTE
         if self.skip_connect:
-            if not_use_gt_rgbd:
+            if not_use_dynamic_mask:
                 self.mlp_mask1 = torch.nn.Conv2d(64+4, 1, 1, bias=False)
+                self.mlp_head1 = torch.nn.Conv2d(64+4, ks**2, 1, bias=False) # NOTE
             else:
-                self.mlp_mask1 = torch.nn.Conv2d(64+8, 1, 1, bias=False)
+                self.mlp_mask1 = torch.nn.Conv2d(64+5, 1, 1, bias=False)
+                self.mlp_head1 = torch.nn.Conv2d(64+5, ks**2, 1, bias=False) # NOTE
         else:
             self.mlp_mask1 = torch.nn.Conv2d(64, 1, 1, bias=False)
+            self.mlp_head1 = torch.nn.Conv2d(64, ks**2, 1, bias=False) # NOTE
 
-        if not not_use_rgbd and not_use_gt_rgbd:
+        if not not_use_rgbd and not_use_dynamic_mask:
             self.conv_rgbd = torch.nn.Sequential(
                 torch.nn.Conv2d(4, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
                 torch.nn.Conv2d(64, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
                 torch.nn.Conv2d(64, 32, 3,padding=1)
                 )
-        if not not_use_rgbd and not not_use_gt_rgbd:
+        if not not_use_rgbd and not not_use_dynamic_mask:
             self.conv_rgbd = torch.nn.Sequential(
-                torch.nn.Conv2d(8, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
+                torch.nn.Conv2d(5, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
                 torch.nn.Conv2d(64, 64, 5,padding=2), torch.nn.ReLU(), torch.nn.InstanceNorm2d(64),
                 torch.nn.Conv2d(64, 32, 3,padding=1)
                 )
@@ -89,11 +92,14 @@ class Blur(nn.Module):
             rgbd_feat = self.conv_rgbd(img) # 1, 32, 400, 940
             feat = self.mlp_base_mlp(torch.cat([inp,rgbd_feat],1)) # 1, 64, 400, 940
 
-        weight = self.mlp_head1(feat) # 1, 9 * 9, 400, 940
+        # weight = self.mlp_head1(feat) # 1, 9 * 9, 400, 940 # NOTE
         if self.skip_connect:
             mask = self.mlp_mask1(torch.cat([feat,img],1)) # 1, 1, 400, 940
+            weight = self.mlp_head1(torch.cat([feat,img],1)) # 1, 9 * 9, 400, 940 # NOTE
         else:
             mask = self.mlp_mask1(feat) # 1, 1, 400, 940
+            weight = self.mlp_head1(feat) # 1, 9 * 9, 400, 940 # NOTE
+
 
         weight = torch.softmax(weight, dim=1)
         mask = torch.sigmoid(mask)

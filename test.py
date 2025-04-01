@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 import cv2
+import subprocess
 from PIL import Image
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
@@ -153,8 +154,8 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 # path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
 # for scene in sorted(os.listdir(path)):
 
-#     # pose_path = path + scene + "/poses_bounds.npy"
-#     pose_path = path + scene + "/dense/poses_bounds.npy"
+#     # pose_path = path + scene + "/poses_bounds.png"
+#     pose_path = path + scene + "/dense/poses_bounds.png"
     
 #     poses_arr = np.load(pose_path)
 #     poses = poses_arr[:, :-2].reshape([-1, 3, 5]) # 34, 3, 5
@@ -197,18 +198,48 @@ def knn_chunk_change2(reference, query, chunk=30000, k=5): # B, gs_num, 3; MARK:
 # interp_values = interp_func(points) # 2,
 # print(interp_values)
 ######################## Bilinear Interpolation ########################
+def change(a_path, b_path, mid_path):
+    # copy 
+    command = "cp {0} {1}".format(a_path, mid_path)
+    subprocess.run(command, shell=True)
 
-path = "/home/xuankai/code/dydeblur/data/D2RF/Dock"
-depth_path = sorted(os.listdir(os.path.join(path,"dpt")))
+    # delete
+    command = "rm -f {0}".format(a_path)
+    subprocess.run(command, shell=True)
 
+    # rename
+    command = "mv {0} {1}".format(b_path, a_path)
+    subprocess.run(command, shell=True)
+    command = "mv {0} {1}".format(mid_path, b_path)
+    subprocess.run(command, shell=True)
 
-xyz_worlds = np.empty((0, 3))
-images = np.empty((0, 3))
-for i in range(len(depth_path)):
-    if i % 2 == 1:
-        continue
-    disparity = np.load(os.path.join(path, "dpt", depth_path[i])) # 400, 940
-    disparity = disparity - disparity.min()
-    disparity = disparity / disparity.max()
-    cv2.imwrite("/home/xuankai/code/disparity.png",disparity*255)
-    print("ok")
+# data_path = "/mnt/data0/xuankai/Deblur4DGS/stereo_high_dataset/man/"
+data_path = "/mnt/data0/xuankai/Deblur4DGS/stereo_low_dataset/man/"
+# factor = ["x1/","x2/","x4/","x8/"]
+factor = ["x1/"]
+for i in factor:
+    # imagedir = ["images/", "images_test/"]
+    imagedir = ["images/"]
+    # imagedir = ["flow3d_preprocessed/aligned_depth_anything_colmap/"]
+    for j in imagedir:
+        path = data_path + i + j
+
+        a_path = path + "00010.png"
+        b_path = path + "00011.png"
+        mid_path = path + "00010new.png"
+        change(a_path, b_path, mid_path)
+        a_path = path + "00022.png"
+        b_path = path + "00023.png"
+        mid_path = path + "00022new.png"
+        change(a_path, b_path, mid_path)
+        a_path = path + "00034.png"
+        b_path = path + "00035.png"
+        mid_path = path + "00034new.png"
+        change(a_path, b_path, mid_path)
+        a_path = path + "00046.png"
+        b_path = path + "00047.png"
+        mid_path = path + "00046new.png"
+        change(a_path, b_path, mid_path)
+
+print('ok')
+

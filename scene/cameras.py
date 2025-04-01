@@ -17,7 +17,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, K, FoVx, FoVy, image, gt_alpha_mask, image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None, depthv2=None, blur_map=None, motion_mask=None, is_virtual=False):
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", fid=None, depth=None, depthv2=None, depth_no_sc=None, blur_map=None, motion_mask=None, is_virtual=False):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -42,6 +42,7 @@ class Camera(nn.Module):
         self.image_height = self.original_image.shape[1]
         self.depth = torch.Tensor(depth).to(self.data_device) if depth is not None else None # 288, 512
         self.depthv2 = torch.Tensor(depthv2).to(self.data_device) if depthv2 is not None else None # 288, 512
+        self.depth_no_sc = torch.Tensor(depth_no_sc).to(self.data_device) if depth_no_sc is not None else None # 288, 512
         self.blur_map = torch.Tensor(blur_map).to(self.data_device) if blur_map is not None else None # 288, 512
         self.motion_mask = torch.Tensor(motion_mask).to(self.data_device) if motion_mask is not None else None # 288, 512
 

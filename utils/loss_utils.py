@@ -173,3 +173,107 @@ def align_loss_center(iteration, init=1.0, final=0.5, start_iteration=10000):
         t = np.clip((iteration - start_iteration) / (35000 - start_iteration), 0, 1)
         log_center = np.exp(np.log(init) * (1 - t) + np.log(final) * t)
         return log_center
+    
+def project_2d_tracks(tracks_3d_w, Ks, T_cw, return_depth=False):
+    """
+    :param tracks_3d_w (torch.Tensor): (T, N, 3)
+    :param Ks (torch.Tensor): (T, 3, 3)
+    :param T_cw (torch.Tensor): (T, 4, 4)
+    :returns tracks_2d (torch.Tensor): (T, N, 2)
+    """
+    tracks_3d_c = torch.einsum(
+        "tij,tnj->tni", T_cw, F.pad(tracks_3d_w, (0, 1), value=1)
+    )[..., :3]
+    tracks_3d_v = torch.einsum("tij,tnj->tni", Ks, tracks_3d_c)
+    if return_depth:
+        return (
+            tracks_3d_v[..., :2] / torch.clamp(tracks_3d_v[..., 2:], min=1e-5),
+            tracks_3d_v[..., 2],
+        )
+    return tracks_3d_v[..., :2] / torch.clamp(tracks_3d_v[..., 2:], min=1e-5)
+
+def trimmed_l1_loss(pred, gt, quantile=0.9):
+    loss = F.l1_loss(pred, gt, reduction="none").mean(dim=-1)
+    loss_at_quantile = torch.quantile(loss, quantile)
+    trimmed_loss = loss[loss < loss_at_quantile].mean()
+    return trimmed_loss
+
+def masked_l1_loss(pred, gt, mask=None, normalize=True, quantile: float = 1.0):
+    if mask is None:
+        return trimmed_l1_loss(pred, gt, quantile)
+    else:
+        sum_loss = F.l1_loss(pred, gt, reduction="none").mean(dim=-1, keepdim=True)
+        quantile_mask = (
+            (sum_loss < torch.quantile(sum_loss, quantile)).squeeze(-1)
+            if quantile < 1
+            else torch.ones_like(sum_loss, dtype=torch.bool).squeeze(-1)
+        )
+        ndim = sum_loss.shape[-1]
+        if normalize:
+            return torch.sum((sum_loss * mask)[quantile_mask]) / (
+                ndim * torch.sum(mask[quantile_mask]) + 1e-8
+            )
+        else:
+            return torch.mean((sum_loss * mask)[quantile_mask])
+        
+def compute_z_acc_loss(means_ts_nb: torch.Tensor, w2cs: torch.Tensor):
+    """
+    :param means_ts (G, 3, B, 3)
+    :param w2cs (B, 4, 4)
+    return (float)
+    """
+    camera_center_t = torch.linalg.inv(w2cs)[:, :3, 3]  # (B, 3)
+    ray_dir = F.normalize(
+        means_ts_nb[:, 1] - camera_center_t, p=2.0, dim=-1
+    )  # [G, B, 3]
+    # acc = 2 * means[:, 1] - means[:, 0] - means[:, 2]  # [G, B, 3]
+    # acc_loss = (acc * ray_dir).sum(dim=-1).abs().mean()
+    acc_loss = (
+        ((means_ts_nb[:, 1] - means_ts_nb[:, 0]) * ray_dir).sum(dim=-1) ** 2
+    ).mean() + (
+        ((means_ts_nb[:, 2] - means_ts_nb[:, 1]) * ray_dir).sum(dim=-1) ** 2
+    ).mean()
+    return acc_loss
+
+
+def compute_se3_smoothness_loss(
+    rots: torch.Tensor,
+    transls: torch.Tensor,
+    weight_rot: float = 1.0,
+    weight_transl: float = 2.0,
+):
+    """
+    central differences
+    :param motion_transls (K, T, 3)
+    :param motion_rots (K, T, 6)
+    """
+    r_accel_loss = compute_accel_loss(rots)
+    t_accel_loss = compute_accel_loss(transls)
+    return r_accel_loss * weight_rot + t_accel_loss * weight_transl
+
+
+def compute_accel_loss(transls):
+    accel = 2 * transls[:, 1:-1] - transls[:, :-2] - transls[:, 2:]
+    loss = accel.norm(dim=-1).mean()
+    return loss
+
+def compute_gradient_loss(pred, gt, mask, quantile=0.98):
+    """
+    Compute gradient loss
+    pred: (batch_size, H, W, D) or (batch_size, H, W)
+    gt: (batch_size, H, W, D) or (batch_size, H, W)
+    mask: (batch_size, H, W), bool or float
+    """
+    # NOTE: messy need to be cleaned up
+    mask_x = mask[:, :, 1:] * mask[:, :, :-1]
+    mask_y = mask[:, 1:, :] * mask[:, :-1, :]
+    pred_grad_x = pred[:, :, 1:] - pred[:, :, :-1]
+    pred_grad_y = pred[:, 1:, :] - pred[:, :-1, :]
+    gt_grad_x = gt[:, :, 1:] - gt[:, :, :-1]
+    gt_grad_y = gt[:, 1:, :] - gt[:, :-1, :]
+    loss = masked_l1_loss(
+        pred_grad_x[mask_x][..., None], gt_grad_x[mask_x][..., None], quantile=quantile
+    ) + masked_l1_loss(
+        pred_grad_y[mask_y][..., None], gt_grad_y[mask_y][..., None], quantile=quantile
+    )
+    return loss

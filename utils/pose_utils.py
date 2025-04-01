@@ -9,6 +9,8 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+# from colmap_utils import get_colmap_camera_params
+from utils.colmap_utils import get_colmap_camera_params
 
 trans_t = lambda t: torch.Tensor([
     [1, 0, 0, 0],
@@ -234,31 +236,50 @@ def fetchPly(path): # fetch points
 
 if __name__ == "__main__": # TODO point visual
     # path = "/home/xuankai/code/d-3dgs/data/D2RF/"
-    path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+    # path = "/home/xuankai/code/d-3dgs/data/DyBluRF/stereo_blur_dataset/"
+    # path = "/home/xuankai/code/dydeblur/data/Deblur4DGS/stereo_low_dataset/"
+    path = "/home/xuankai/code/dydeblur/data/Deblur4DGS/stereo_high_dataset/"
     for scene in sorted(os.listdir(path)):
         # pose_path = path + scene + "/poses_bounds.npy"
-        # point_path = path + scene + "/sparse_/points3D.ply"
+        point_path = path + scene + "/sparse_/points3D.ply"
         # save_path = "/home/xuankai/code/d-3dgs/assets/camera/D2RF/" + scene + ".png"
 
-        pose_path = path + scene + "/dense/poses_bounds.npy"
-        point_path = path + scene + "/dense/sparse_/points3D.ply"
-        save_path = "/home/xuankai/code/d-3dgs/assets/points/DyBluRF/" + scene + ".png"
+        # pose_path = path + scene + "/dense/poses_bounds.npy"
+        # point_path = path + scene + "/dense/sparse_/points3D.ply"
+        # save_path = "/home/xuankai/code/d-3dgs/assets/points/DyBluRF/" + scene + ".png"
 
-        poses = np.load(pose_path)
-        poses = poses[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3, 5, 34
+        # poses = np.load(pose_path)
+        # poses = poses[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3, 5, 34
 
-        poses = np.concatenate([poses[:, 1:2, :], 
-                                -poses[:, 0:1, :], 
-                                poses[:, 2:, :]], 1) # llff (DRB) -> nerf (RUB)
-        poses = np.concatenate([poses[:, 0:1, :], 
-                                -poses[:, 1:3, :], 
-                                poses[:, 3:, :]], 1) # nerf (RUB) -> colmap (RDF)
-        poses = np.moveaxis(poses, -1, 0).astype(np.float32) # 34, 3, 5
-        bottom = np.array([[0,0,0,1]]).repeat(poses.shape[0], axis=0) # 34, 4
-        c2ws = np.concatenate([poses[..., :4], bottom[:,np.newaxis,:]], 1) # 34, 4, 4
+        # poses = np.concatenate([poses[:, 1:2, :], 
+        #                         -poses[:, 0:1, :], 
+        #                         poses[:, 2:, :]], 1) # llff (DRB) -> nerf (RUB)
+        # poses = np.concatenate([poses[:, 0:1, :], 
+        #                         -poses[:, 1:3, :], 
+        #                         poses[:, 3:, :]], 1) # nerf (RUB) -> colmap (RDF)
+        # poses = np.moveaxis(poses, -1, 0).astype(np.float32) # 34, 3, 5
+        # bottom = np.array([[0,0,0,1]]).repeat(poses.shape[0], axis=0) # 34, 4
+        # c2ws = np.concatenate([poses[..., :4], bottom[:,np.newaxis,:]], 1) # 34, 4, 4
 
-        # visualizer = CameraPoseVisualizer([-20, 20], [-20, 20], [0, 15])
-        visualizer = CameraPoseVisualizer([-200, 200], [-100, 100], [-20, 400])
+        pose_path = path + scene + "/x1/flow3d_preprocessed/colmap/sparse"
+        save_path = "/home/xuankai/code/dydeblur/assets/Camera/Deblur4DGS/high/" + scene + ".png"
+
+        imgdir = os.path.join(path, scene, 'x1/images')
+        imgfiles_all = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+
+        frame_names_all = [f.split('/')[-1].split('.')[0] for f in imgfiles_all] # '00000', '00001', '00002'
+        Ks, w2cs = get_colmap_camera_params( # 48, 4, 4
+            pose_path, [frame_name + ".png" for frame_name in frame_names_all],)
+
+        # w2cs[[10,11,22,23,34,35,46,47]] = w2cs[[11,10,23,22,35,34,47,46]] # MARK: change
+
+        w2cs = torch.from_numpy(w2cs.astype(np.float32)) # 48, 4, 4
+        c2ws = w2cs.inverse() # 48, 4, 4
+        c2ws = c2ws.numpy()
+
+        visualizer = CameraPoseVisualizer([-20, 20], [-20, 20], [0, 15])
+        # visualizer = CameraPoseVisualizer([-200, 200], [-100, 100], [-20, 400])
         for idx in range(c2ws.shape[0]):
             if idx % 2 == 0: # train
                 color = 'r'
@@ -267,8 +288,11 @@ if __name__ == "__main__": # TODO point visual
 
             c2w = c2ws[idx]
             # argument : extrinsic matrix, color, scaled focal length(z-axis length of frame body of camera
-            visualizer.extrinsic2pyramid(c2w, color, 15)
+            visualizer.extrinsic2pyramid(c2w, color, 5)
     
-        points = fetchPly(point_path)
-        visualizer.pointvisual(points, color='b')
+        add_point = False
+        if add_point:
+            points = fetchPly(point_path)
+            visualizer.pointvisual(points, color='b')
         visualizer.save(save_path)
+    print('ok!')

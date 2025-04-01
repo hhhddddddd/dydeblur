@@ -11,17 +11,38 @@
 
 import torch
 import numpy as np
+import cupy as cp
 from utils.general_utils import inverse_sigmoid, gumbel_sigmoid, inverse_gumbel_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
+import torch.nn.functional as F
 import os
+import roma
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.general_utils import  TrackObservations, StaticObservations, strip_symmetric, build_scaling_rotation, get_linear_noise_func, knn
 from scene.blur_kernel import GTnet
+from scene.motion_model import init_motion_params_with_procrustes
+from random import randint
 
+class GaussianParams(nn.Module):
+    def __init__(self, means, quats, scales, colors, opacities, motion_coefs, dynamics):
+        super().__init__()
+        self.means = means
+        self.quats = quats
+        self.scales = scales
+        self.colors = colors
+        self.opacities = opacities
+        self.motion_coefs = motion_coefs
+        self.dynamics = dynamics
+
+        params_dict = { # only for fg
+            "means": nn.Parameter(means),
+            "motion_coefs": nn.Parameter(motion_coefs),
+        }
+        self.params = nn.ParameterDict(params_dict)
 
 class GaussianModel: # when initial, gaussians is already belong to scene
     def __init__(self, sh_degree: int): # contain setup_functions
@@ -41,7 +62,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
-        self._dynamic = torch.empty(0)
+        self._motion_coefs = torch.empty(0)
+        self._dynamics = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.gumbel_noise = torch.empty(0)
@@ -56,8 +78,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
-        self.dynamic_activation = torch.sigmoid
-        self.inverse_dynamic_activation = inverse_sigmoid
+        self.motion_coefs_activation = lambda x: F.softmax(x, dim=-1)
+        # self.inverse_motion_coefs_activation = None
 
         # self.dynamic_activation = gumbel_sigmoid
         # self.inverse_dynamic_activation = inverse_gumbel_sigmoid
@@ -77,18 +99,30 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         return self._xyz
 
     @property
+    def get_dynamics(self):
+        return self._dynamics
+
+    @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
+    def get_features_dc(self):
+        return self._features_dc
+    
+    @property
+    def get_features_rest(self):
+        return self._features_rest   
+
+    @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
 
     @property
-    def get_dynamic(self):
-        ret = self.dynamic_activation(self._dynamic)
+    def get_motion_coefs(self):
+        ret = self.motion_coefs_activation(self._motion_coefs)
         return ret
 
     def get_covariance(self, scaling_modifier=1):
@@ -115,7 +149,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1 # NOTE don't understand
-        dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+        motion_coefs = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+        # dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
@@ -125,8 +160,165 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
-        self._dynamic = nn.Parameter(dynamics.requires_grad_(True))
+        self._motion_coefs = nn.Parameter(motion_coefs.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def create_from_track(self, fg_params, bg_params, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale   # spatial_lr_scale: camera_extent
+        fused_point_cloud = torch.cat([fg_params.means.detach(), bg_params.means.detach()], dim=0).float().cuda()     # torch.Size([100000, 3])
+        fused_color = RGB2SH(torch.cat([fg_params.colors, bg_params.colors], dim=0).float().cuda())   # torch.Size([100000, 3])
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda() # torch.Size([100000, 3, 16])
+        features[:, :3, 0] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        scales = torch.cat([fg_params.scales, bg_params.scales], dim=0).cuda() 
+        rots = torch.cat([fg_params.quats, bg_params.quats], dim=0).cuda() 
+        rots[:, 0] = 1 # NOTE don't understand
+        motion_coefs = torch.cat([fg_params.motion_coefs.detach(), bg_params.motion_coefs.detach()], dim=0).cuda() 
+        dynamics = torch.cat([fg_params.dynamics, bg_params.dynamics], dim=0).cuda() 
+        opacities = torch.cat([fg_params.opacities, bg_params.opacities], dim=0).cuda() 
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))     # direct color  torch.Size([100000, 1, 3])
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))    # rest color    torch.Size([100000, 15, 3])
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._motion_coefs = nn.Parameter(motion_coefs.requires_grad_(True))
+        self._dynamics = nn.Parameter(dynamics.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def depth_track_point(self, foreground_points, background_points, cano_t, num_motion_bases=20): # origin: 20
+        tracks_3d = TrackObservations(  xyz=foreground_points[0],
+                                        visibles=foreground_points[1],
+                                        invisibles=foreground_points[2],
+                                        confidences=foreground_points[3],
+                                        colors=foreground_points[4])
+
+        rot_type = "6d"
+        cano_t = int(tracks_3d.visibles.sum(dim=0).argmax().item()) # 10
+        # cano_t = 20
+        print("cano_t:", cano_t)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # cuda
+
+        motion_bases, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
+            tracks_3d, num_motion_bases, rot_type, cano_t)
+        motion_bases = motion_bases.to(device)
+
+        fg_params, idcs = self.init_fg(cano_t, tracks_3d, motion_coefs)
+        fg_params = fg_params.to(device)
+
+        if idcs is not None:
+            xyz = tracks_3d.xyz[idcs] # 7392, 24, 3
+            visibles = tracks_3d.visibles[idcs] # 7392, 24
+            invisibles = tracks_3d.invisibles[idcs] # 7392, 24
+            confidences = tracks_3d.confidences[idcs] # 7392, 24
+            colors = tracks_3d.colors[idcs] # 7392, 3
+
+            tracks_3d = TrackObservations( xyz=xyz, visibles=visibles, invisibles=invisibles, confidences=confidences, colors=colors)
+
+        bg_points = StaticObservations( xyz=background_points[0],
+                                        normals=background_points[1],
+                                        colors=background_points[2])
+        bg_params = self.init_bg(bg_points, num_motion_bases)
+        bg_params = bg_params.to(device)
+
+        # tracks_3d = tracks_3d.to(device)
+
+        return fg_params, motion_bases, bg_params, tracks_3d # tracks_3d for 'run_initial_optim'
+    
+    def init_fg(self, cano_t, tracks_3d, motion_coefs):
+        visibiles = True
+        # visibiles = False
+        if visibiles:
+            vis = tracks_3d.visibles[:, cano_t]
+            idcs = torch.where(vis)[0]
+            # Initialize gaussian means.
+            means = tracks_3d.xyz[idcs, cano_t]
+
+            num_fg = means.shape[0]
+
+            # Initialize gaussian colors.
+            colors = tracks_3d.colors[idcs]
+            # Initialize gaussian scales: find the average of the three nearest
+            # neighbors in the first frame for each point and use that as the
+            # scale.
+            dists, _ = knn(means, 3)
+            dists = torch.from_numpy(dists)
+            scales = dists.mean(dim=-1, keepdim=True)
+            scales = scales.clamp(torch.quantile(scales, 0.05), torch.quantile(scales, 0.95))
+            scales = torch.log(scales.repeat(1, 3))
+
+            # Initialize gaussian orientations as random.
+            quats = torch.rand(num_fg, 4)
+            # Initialize gaussian opacities.
+            opacities = torch.logit(torch.full((num_fg,), 0.7)).unsqueeze(1) # logit <=> sigmoid
+            dynamics = torch.ones(num_fg, 1) # fg: torch.ones
+            motion_coefs = motion_coefs[idcs]
+        else:
+            idcs = None
+            num_fg = tracks_3d.xyz.shape[0]
+
+            # Initialize gaussian colors.
+            colors = tracks_3d.colors
+            # Initialize gaussian scales: find the average of the three nearest
+            # neighbors in the first frame for each point and use that as the
+            # scale.
+            dists, _ = knn(tracks_3d.xyz[:, cano_t], 3)
+            dists = torch.from_numpy(dists)
+            scales = dists.mean(dim=-1, keepdim=True)
+            scales = scales.clamp(torch.quantile(scales, 0.05), torch.quantile(scales, 0.95))
+            scales = torch.log(scales.repeat(1, 3))
+            # Initialize gaussian means.
+            means = tracks_3d.xyz[:, cano_t]
+            # Initialize gaussian orientations as random.
+            quats = torch.rand(num_fg, 4)
+            # Initialize gaussian opacities.
+            opacities = torch.logit(torch.full((num_fg,), 0.7)).unsqueeze(1) # logit <=> sigmoid
+            dynamics = torch.ones(num_fg, 1) # fg: torch.ones
+        gaussians = GaussianParams(means, quats, scales, colors, opacities, motion_coefs, dynamics) # MARK: fg
+        return gaussians, idcs
+
+    def init_bg(self, points, num_motion_bases):
+        """
+        using dataclasses instead of individual tensors so we know they're consistent
+        and are always masked/filtered together
+        """
+        num_init_bg_gaussians = points.xyz.shape[0]
+        bg_points_centered = points.xyz 
+        bg_scene_center = points.xyz.mean(0)
+        bg_points_centered = points.xyz - bg_scene_center
+        bg_min_scale = bg_points_centered.quantile(0.05, dim=0)
+        bg_max_scale = bg_points_centered.quantile(0.95, dim=0)
+        bg_scene_scale = torch.max(bg_max_scale - bg_min_scale).item() / 2.0 # bg_scene_scale
+        bkdg_colors = points.colors
+
+        # Initialize gaussian scales: find the average of the three nearest
+        # neighbors in the first frame for each point and use that as the
+        # scale.
+        dists, _ = knn(points.xyz, 3)
+        dists = torch.from_numpy(dists)
+        bg_scales = dists.mean(dim=-1, keepdim=True)
+        bkdg_scales = torch.log(bg_scales.repeat(1, 3))
+
+        bg_means = points.xyz
+
+        # Initialize gaussian orientations by normals.
+        local_normals = points.normals.new_tensor([[0.0, 0.0, 1.0]]).expand_as(
+            points.normals
+        )
+        bg_quats = roma.rotvec_to_unitquat(
+            F.normalize(local_normals.cross(points.normals, dim=-1), dim=-1)
+            * (local_normals * points.normals).sum(-1, keepdim=True).acos_()
+        ).roll(1, dims=-1)
+        bg_opacities = torch.logit(torch.full((num_init_bg_gaussians,), 0.7)).unsqueeze(1)
+        bg_motion_coefs = torch.ones(num_init_bg_gaussians, num_motion_bases).cuda() # 100000, 10; NOTE bg_motion_coefs
+        dynamics = torch.zeros(num_init_bg_gaussians, 1) # bg: torch.zeros
+        gaussians = GaussianParams(bg_means, bg_quats, bkdg_scales, bkdg_colors, bg_opacities, bg_motion_coefs, dynamics)
+
+        return gaussians
 
     def training_setup(self, training_args): # Initialize the optimizer and the learning rate scheduler; training_args: opt
         self.percent_dense = training_args.percent_dense
@@ -142,7 +334,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr * self.spatial_lr_scale, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
-            {'params': [self._dynamic], 'lr': training_args.dynamic_lr, "name": "dynamic"},
+            {'params': [self._motion_coefs], 'lr': training_args.motion_coefs_lr, "name": "motion_coefs"},
+            {'params': [self._dynamics], 'lr': 0.1, "name": "dynamics"},
             {'params': self.GTnet.parameters(), 'lr': training_args.gtnet_lr, "name": "GTnet"}
         ]
 
@@ -179,7 +372,9 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         for i in range(self._features_rest.shape[1] * self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
-        l.append('dynamic')
+        l.append('dynamics')
+        for i in range(self._motion_coefs.shape[1]):
+            l.append('motion_coefs_{}'.format(i))
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -194,14 +389,15 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        dynamics = self._dynamics.detach().cpu().numpy()
+        motion_coefs = self._motion_coefs.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
-        dynamic = self._dynamic.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, dynamic, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, dynamics, motion_coefs, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -219,7 +415,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
-        dynamic = np.asarray(plydata.elements[0]["dynamic"])[..., np.newaxis]
+        dynamics = np.asarray(plydata.elements[0]["dynamics"])[..., np.newaxis]
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -244,6 +440,11 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        motion_coefs_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("motion_coefs_")]
+        motion_coefs = np.zeros((xyz.shape[0], len(motion_coefs_names)))
+        for idx, attr_name in enumerate(motion_coefs_names):
+            motion_coefs[:, idx] = np.asarray(plydata.elements[0][attr_name])
+
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(
             torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(
@@ -254,7 +455,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._dynamic = nn.Parameter(torch.tensor(dynamic, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._motion_coefs = nn.Parameter(torch.tensor(motion_coefs, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._dynamics = nn.Parameter(torch.tensor(dynamics, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree
 
@@ -269,7 +471,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
+        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, motion_coefs, dynamics
             if group["name"] == name: # density
                 stored_state = self.optimizer.state.get(group['params'][0], None) # get state dictionary
                 if stored_state is not None:
@@ -288,7 +490,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
+        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, motion_coefs, dynamics
             if group['name'] == "GTnet":
                 continue
             stored_state = self.optimizer.state.get(group['params'][0], None) # get state dictionary
@@ -317,7 +519,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic = optimizable_tensors["dynamic"]
+        self._motion_coefs = optimizable_tensors["motion_coefs"]
+        self._dynamics = optimizable_tensors["dynamics"]
 
         # prune xyz_gradient_accm, denom, max_radii2D
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
@@ -326,7 +529,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
-        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, dynamic
+        for group in self.optimizer.param_groups: # xyz, r, s, density, f_dc, f_rest, motion_coefs, dynamics
             if group['name'] == "GTnet":
                 continue
             assert len(group["params"]) == 1
@@ -353,14 +556,15 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         return optimizable_tensors
 
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_dynamic, selected_pts_mask=None, N=1,  add_sfm_point=False):
+                              new_rotation, new_motion_coefs, new_dynamics, selected_pts_mask=None, N=1, add_sfm_point=False):
         d = {"xyz": new_xyz,
              "f_dc": new_features_dc,
              "f_rest": new_features_rest,
              "opacity": new_opacities,
              "scaling": new_scaling,
              "rotation": new_rotation,
-             "dynamic": new_dynamic} # new gaussian attribute
+             "motion_coefs": new_motion_coefs,
+             "dynamics": new_dynamics} # new gaussian attribute
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -369,7 +573,8 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        self._dynamic = optimizable_tensors["dynamic"]
+        self._motion_coefs = optimizable_tensors["motion_coefs"]
+        self._dynamics = optimizable_tensors["dynamics"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda") # clear accumulating gradient
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -400,9 +605,10 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
-        new_dynamic = self._dynamic[selected_pts_mask].repeat(N, 1)
+        new_motion_coefs = self._motion_coefs[selected_pts_mask].repeat(N, 1)
+        new_dynamics = self._dynamics[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_dynamic, selected_pts_mask, N=N)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_motion_coefs, new_dynamics, selected_pts_mask, N=N)
 
         # Delete the original Gaussian
         prune_filter = torch.cat(
@@ -422,10 +628,11 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-        new_dynamic = self._dynamic[selected_pts_mask]
+        new_motion_coefs = self._motion_coefs[selected_pts_mask]
+        new_dynamics = self._dynamics[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_dynamic, selected_pts_mask)
+                                   new_rotation, new_motion_coefs, new_dynamics, selected_pts_mask)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration): # max_screen_size: size_threshold
         grads = self.xyz_gradient_accum / self.denom # [gs_num, 1]
@@ -454,6 +661,10 @@ class GaussianModel: # when initial, gaussians is already belong to scene
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
             gs_num['scale'] = str(big_points_ws.sum().cpu().item())
         self.prune_points(prune_mask)
+        
+        fg = self.get_dynamics.detach().bool().squeeze() # 107392, 1;
+        bg = ~fg
+        print('fg_gs={}, bg_gs={}'.format(fg.sum().item(), bg.sum().item()))
 
         torch.cuda.empty_cache()
         return gs_num
@@ -497,3 +708,279 @@ class GaussianModel: # when initial, gaussians is already belong to scene
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation, new_dynamic, add_sfm_point=True)
+
+    def depth_reinit(self, scene, render_depth, iteration, num_depth, args, pipe, background, deform):
+
+        out_pts_list = []
+        gt_list = []
+        views = scene.getTrainCameras().copy()
+        smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
+        for view in views:
+            gt = view.original_image[0:3, :, :]
+            if iteration < 3000: # warm_up == 3000
+                d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+            else:
+                N = self.get_xyz.shape[0]  # current gaussian quantity, eg: 10587
+                time_input = view.fid.unsqueeze(0).expand(N, -1) # Expand the input in the time dimension, eg:torch.Size([10587,1])
+                time_interval = 1 / (randint(0, len(views)-1) + 1)
+                ast_noise = torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration) # for time_input; why do this?
+                d_xyz, d_rotation, d_scaling, _ = deform.step(self.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
+
+            render_depth_pkg = render_depth(view, self, pipe, background, d_xyz, d_rotation, d_scaling)
+
+            out_pts = render_depth_pkg["out_pts"] # 3, 400, 940
+            accum_alpha = render_depth_pkg["accum_alpha"] # 1, 400, 940
+
+            prob = 1 - accum_alpha
+            prob = prob / prob.sum()
+            prob = prob.reshape(-1).cpu().numpy()
+
+            factor = 1 / (gt.shape[1]*gt.shape[2]*len(views) / num_depth)
+
+            N_xyz = prob.shape[0] # 400 * 940
+            num_sampled = int(N_xyz*factor)
+
+            indices = np.random.choice(N_xyz, size=num_sampled, p=prob, replace=False)
+            
+            out_pts = out_pts.permute(1,2,0).reshape(-1,3)
+            gt = gt.permute(1,2,0).reshape(-1,3)
+
+            out_pts_list.append(out_pts[indices])
+            gt_list.append(gt[indices])       
+
+        out_pts_merged=torch.cat(out_pts_list) # 59670, 3
+        gt_merged=torch.cat(gt_list) # 59670, 3
+
+        return out_pts_merged, gt_merged
+
+    def reinitial_pts(self, pts, rgb):
+
+        fused_point_cloud = pts
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        # print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._dynamic = nn.Parameter(dynamics.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  
+
+    def add_depth_points(self, pts, rgb):
+
+        fused_point_cloud = pts
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        scales =  torch.log(torch.ones_like(pts) * 0.1).cuda() # Empirically 0.1
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        dynamics = torch.zeros((fused_point_cloud.shape[0], 1), device="cuda")
+
+        opacities = inverse_sigmoid(0.9 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")) # large opacity 0.9
+
+        new_xyz = fused_point_cloud
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+        new_opacities = opacities
+        new_scaling = scales
+        new_rotation = rots
+        new_dynamic = dynamics
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                   new_rotation, new_dynamic, add_sfm_point=True)
+        
+    def depth_reinit_som(self, scene, render_depth_som, iteration, num_depth, args, pipe, background, motion_model):
+
+        out_pts_list = []
+        gt_list = []
+        views = scene.getTrainCameras().copy()
+        
+        with torch.no_grad():
+            fg = self.get_dynamics.bool().squeeze() # 107392, 1;
+            indices = torch.nonzero(fg).squeeze() 
+            means = self.get_xyz.detach()          # 107392, 3
+            quats = self.get_rotation.detach()     # 107392, 4
+            coefs = self.get_motion_coefs.detach() # 107392, 10
+            fg_means = means[indices]   # 7392, 3
+            fg_quats = quats[indices]   # 7392, 4
+            fg_coefs = coefs[indices]   # 7392, 10
+
+            for view in views:
+                gt = (view.original_image[0:3, :, :]).permute(1,2,0).reshape(-1,3)  # h*w, 3
+                gt_mask = view.motion_mask.bool().reshape(-1) # h*w
+
+                transfms = motion_model.compute_transforms(torch.tensor([view.uid]).cuda().float(), fg_coefs)  # 7392, 1, 3, 4 
+
+                new_fg_means = torch.einsum( # 7392, 1, 3
+                    "pnij,pj->pni",
+                    transfms,
+                    F.pad(fg_means, (0, 1), value=1.0),
+                )
+                new_fg_quats = roma.quat_xyzw_to_wxyz( # 7392, 1, 4 
+                    (
+                        roma.quat_product(
+                            roma.rotmat_to_unitquat(transfms[..., :3, :3]),
+                            roma.quat_wxyz_to_xyzw(fg_quats[:, None]),
+                        )
+                    )
+                )
+                new_fg_quats = F.normalize(new_fg_quats, p=2, dim=-1) # 7392, 1, 4 
+
+                means_clone = means.clone() # 107392, 3
+                quats_clone = quats.clone() # 107392, 4
+                means_clone[indices] = new_fg_means.squeeze(1) # update fg means
+                quats_clone[indices] = new_fg_quats.squeeze(1) # update fg quats
+
+
+                # render_depth_pkg = render_depth_som(view, self, pipe, background, motion_model, indices)
+                render_depth_pkg = render_depth_som(view, self, pipe, background, means_clone, quats_clone)
+
+                out_pts = render_depth_pkg["out_pts"].permute(1,2,0).reshape(-1,3) # 400 * 940, 3
+                # out_pts = render_depth_pkg["render"].permute(1,2,0).reshape(-1,3) # 400 * 940, 3
+                accum_alpha = render_depth_pkg["accum_alpha"].permute(1,2,0).reshape(-1,1) # 400 * 940, 1
+
+                prob = 1 - accum_alpha
+                dynamic_out_pts = out_pts[gt_mask] # n, 3
+                dynamic_gt = gt[gt_mask]
+                dynamic_prob = prob[gt_mask].cpu().numpy() # n, 1
+                dynamic_prob = dynamic_prob / dynamic_prob.sum()
+                dynamic_prob = dynamic_prob.reshape(-1)
+
+                if dynamic_out_pts.shape[0] > 2000:
+                    indices_ = np.random.choice(dynamic_out_pts.shape[0], size=2000, p=dynamic_prob, replace=False)
+                    # indices = np.random.choice(dynamic_out_pts.shape[0], size=1000, replace=False)
+                else:
+                    indices_ = np.arange(dynamic_out_pts.shape[0])
+
+                out_pts_list.append(dynamic_out_pts[indices_])
+                gt_list.append(dynamic_gt[indices_])       
+
+            out_pts_merged=torch.cat(out_pts_list) # 59670, 3
+            gt_merged=torch.cat(gt_list) # 59670, 3
+
+        return out_pts_merged, gt_merged 
+
+    def depth_reinit_som_new(self, scene, render_depth_som, iteration, num_depth, args, pipe, background, motion_model):
+
+        out_pts_list = []
+        gt_list = []
+        views = scene.getTrainCameras().copy()
+        
+        with torch.no_grad():
+            fg = self.get_dynamics.bool().squeeze() # 107392, 1;
+            indices = torch.nonzero(fg).squeeze() 
+            means = self.get_xyz.detach()          # 107392, 3
+            coefs = self.get_motion_coefs.detach() # 107392, 10
+            fg_means = means[indices]   # 7392, 3
+            fg_coefs = coefs[indices]   # 7392, 10
+
+            for view in views:
+                gt = (view.original_image[0:3, :, :]).permute(1,2,0)  # h, w, 3
+                gt_mask = view.motion_mask.bool() # h, w
+                gt_depth = view.depth # h, w
+
+                H, W = gt_depth.shape
+                grid = torch.stack(
+                    torch.meshgrid(
+                        torch.arange(W, dtype=torch.float32),
+                        torch.arange(H, dtype=torch.float32),
+                        indexing="xy",
+                    ),
+                    dim=-1,
+                ).cuda()
+
+                bool_mask = (gt_mask) * (gt_depth > 0).to(torch.bool) # valid dynamic mask
+                R, T, K = view.R, view.T, view.K # R in c2w, T in w2c
+                matrix = np.hstack((np.transpose(R),T.reshape(3,1)))
+                w2c = np.vstack((matrix, np.array([0.,0.,0.,1.])))
+                K, w2c = K.cuda(), torch.tensor(w2c).cuda()
+                points = ( # n_i, 3
+                    torch.einsum(
+                        "ij,pj->pi",
+                        torch.linalg.inv(K),
+                        F.pad(grid[bool_mask], (0, 1), value=1.0),
+                    )
+                    * gt_depth[bool_mask][:, None]
+                )
+                points = torch.einsum( # n_i, 3
+                    "ij,pj->pi", torch.linalg.inv(w2c.float())[:3], F.pad(points, (0, 1), value=1.0)
+                )
+                dynamic_gt = gt[bool_mask] # n_i, 3;
+
+                # observe frame -> canonical frame
+                transfms = motion_model.compute_transforms(torch.tensor([view.uid]).cuda().float(), fg_coefs)  # 7392, 1, 3, 4 
+
+                new_fg_means = torch.einsum( # 7392, 1, 3
+                    "pnij,pj->pni",
+                    transfms,
+                    F.pad(fg_means, (0, 1), value=1.0),
+                )
+
+                # nearest indices
+                distances = torch.cdist(points, new_fg_means[:,0,:], p=2) # n_i, n_fg
+                nearest_indices = torch.argmin(distances, dim=1) # n_i
+                # transferm
+                new_transfms = transfms[nearest_indices] # n_i, 1, 3, 4
+                # real mean
+                R_can2obs = new_transfms[:, 0, :, :3] # n_i, 3, 3
+                t_can2obs = new_transfms[:, 0, :, 3] # n_i, 3
+                R_obs2can = torch.inverse(R_can2obs)
+                dynamic_out_pts = torch.matmul(R_obs2can, (points - t_can2obs).unsqueeze(-1)).squeeze(-1) # n_i, 3
+
+                if dynamic_out_pts.shape[0] > 2000:
+                    indices_ = np.random.choice(dynamic_out_pts.shape[0], size=1000, replace=False)
+                else:
+                    indices_ = np.arange(dynamic_out_pts.shape[0])
+
+                out_pts_list.append(dynamic_out_pts[indices_])
+                gt_list.append(dynamic_gt[indices_])       
+
+            out_pts_merged=torch.cat(out_pts_list) # 59670, 3
+            gt_merged=torch.cat(gt_list) # 59670, 3
+
+        return out_pts_merged, gt_merged 
+
+    def add_depth_points_som(self, pts, rgb):
+
+        fused_point_cloud = pts
+        fused_color = RGB2SH(rgb)
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        scales =  torch.log(torch.ones_like(pts) * 0.5).cuda() # Empirically 0.1
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        dynamics = torch.ones((fused_point_cloud.shape[0], 1), device="cuda")
+        motion_coefs = torch.rand((fused_point_cloud.shape[0], 20), device="cuda")
+
+        opacities = inverse_sigmoid(0.7 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda")) # large opacity 0.9
+
+        new_xyz = fused_point_cloud
+        new_features_dc = features[:, :, 0:1].transpose(1, 2).contiguous()
+        new_features_rest = features[:, :, 1:].transpose(1, 2).contiguous()
+        new_opacities = opacities
+        new_scaling = scales
+        new_rotation = rots
+        new_dynamic = dynamics
+        new_motion_coefs = motion_coefs
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
+                                   new_rotation, new_motion_coefs, new_dynamic, add_sfm_point=True)

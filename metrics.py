@@ -11,10 +11,11 @@
 
 from pathlib import Path
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = '3' # MARK: GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = '7' # MARK: GPU
 from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
+import torch.nn as nn
 from utils.loss_utils import ssim
 # from lpipsPyTorch import lpips
 import lpips
@@ -22,8 +23,20 @@ import json
 import models
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.pwcnet_utils import PWCNet, get_backwarp
 from argparse import ArgumentParser
 
+class OpticalFlow(nn.Module):
+    def __init__ (self):
+        super(OpticalFlow, self).__init__()
+        self.alignnet = PWCNet(load_pretrained=True, 
+                            weights_path="./pwcnet_modules/pwcnet-network-default.pth")
+        self.alignnet.eval()
+    def forward(self, pred, target):
+        with torch.no_grad():
+            offset = self.alignnet(pred, target)  
+        align_pred, flow_mask = get_backwarp(pred, offset)
+        return align_pred*flow_mask, target*flow_mask
 
 def readImages(renders_dir, gt_dir):
     renders = []
@@ -38,12 +51,11 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 
-def evaluate(model_paths, source_paths, model, use_alex=True):
+def evaluate(model_paths, source_paths, model, opticalflow, use_alex=True, use_pwcnet=False):
     full_dict = {}
     per_view_dict = {}
     full_dict_polytopeonly = {}
     per_view_dict_polytopeonly = {}
-    print("")
 
     for scene_dir in model_paths:
         # try:
@@ -53,13 +65,14 @@ def evaluate(model_paths, source_paths, model, use_alex=True):
         full_dict_polytopeonly[scene_dir] = {} # useless
         per_view_dict_polytopeonly[scene_dir] = {} # useless
 
-        motion_mask_dir = Path(source_paths[0]) / "motion_masks"
         masks = []
-        for fname in sorted(os.listdir(motion_mask_dir)):
-            if fname.split('_')[-1] == "left.png":
-                continue
-            mask = Image.open(os.path.join(motion_mask_dir, fname)) # 1, 1, 400, 940
-            masks.append(tf.to_tensor(mask).unsqueeze(0).cuda())       
+        # motion_mask_dir = Path(source_paths[0]) / "motion_masks"
+        # for fname in sorted(os.listdir(motion_mask_dir)):
+        #     if fname.split('_')[-1] == "left.png":
+        #         continue
+        #     mask = Image.open(os.path.join(motion_mask_dir, fname)) # 1, 1, 400, 940
+        #     masks.append(tf.to_tensor(mask).unsqueeze(0).cuda())       
+        
         test_dir = Path(scene_dir) / "test" # PosixPath('output/D_NeRF/trex/test) MARK: train / test
         # test_dir = Path(scene_dir) / "train" # PosixPath('output/D_NeRF/trex/train)
 
@@ -86,6 +99,10 @@ def evaluate(model_paths, source_paths, model, use_alex=True):
             use_mask = False
             if use_mask:
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    if use_pwcnet: # MARK: Pwc-net
+                        renders[idx], gts[idx] = opticalflow(renders[idx], gts[idx]) # 1, 3, 288, 512
+                        # renders[idx] = renders[idx][0].permute(1, 2, 0) # 288, 512, 3
+                        # gts[idx] = gts[idx][0].permute(1, 2, 0) # 288, 512, 3
                     ssims.append(ssim(renders[idx], gts[idx], masks[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx], masks[idx]))
                     if use_alex:
@@ -96,6 +113,10 @@ def evaluate(model_paths, source_paths, model, use_alex=True):
                         lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
             else:
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                    if use_pwcnet: # MARK: Pwc-net
+                        renders[idx], gts[idx] = opticalflow(renders[idx], gts[idx]) # 1, 3, 288, 512
+                        # renders[idx] = renders[idx][0].permute(1, 2, 0) # 288, 512, 3
+                        # gts[idx] = gts[idx][0].permute(1, 2, 0) # 288, 512, 3
                     ssims.append(ssim(renders[idx], gts[idx]))
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     if use_alex:
@@ -136,8 +157,10 @@ if __name__ == "__main__":
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
     parser.add_argument('--source_paths', '-s', required=True, nargs="+", type=str, default=[])
     parser.add_argument('--use_alex', action="store_true")
+    parser.add_argument('--use_pwcnet', action="store_true")
     args = parser.parse_args()
     print("use_alex:",args.use_alex)
     with torch.no_grad():
         model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1)
-    evaluate(args.model_paths, args.source_paths, model, use_alex=args.use_alex) # MARK: model
+    opticalflow = OpticalFlow().cuda()
+    evaluate(args.model_paths, args.source_paths, model, opticalflow, use_alex=args.use_alex, use_pwcnet=args.use_pwcnet) # MARK: model

@@ -12,6 +12,7 @@
 import os
 import sys
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -28,6 +29,8 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.camera_utils import camera_nerfies_from_JSON
+from utils.normal_utils import normal_from_depth_image
+from utils.colmap_utils import get_colmap_camera_params, parse_tapir_track_info, normalize_coords
 from mvs_modules.mvs_estimator import MvsEstimator
 
 class CameraInfo(NamedTuple):
@@ -43,6 +46,7 @@ class CameraInfo(NamedTuple):
     height: int
     fid: float          # frame time
     depth: Optional[np.array] = None
+    depth_no_sc: Optional[np.array] = None
     depthv2: Optional[np.array] = None
     blur_map: Optional[np.array] = None
     motion_mask: Optional[np.array] = None
@@ -57,6 +61,10 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     sc: float = 1.
+    foreground_points: tuple = ()
+    background_points: tuple = ()
+    Ks: torch.Tensor = None
+    w2cs: torch.Tensor = None
 
 
 def load_K_Rt_from_P(filename, P=None):
@@ -680,13 +688,21 @@ def recenter_poses(poses): # poses: 48, 3, 5
     return poses
 
 def readD2RFCameras(path, camera_scale=-1):
+
+    # high = True
+    high = False
     poses_arr = np.load(os.path.join(path, 'poses_bounds.npy')) # MARK: load camera pose
     
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3, 5, 34
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0]) # 3, 5, 34; poses[:,4,0]: 800., 1880., 723.199
     bds = poses_arr[:, -2:].transpose([1,0]) # 2, 34
     
-    imgdir = os.path.join(path, 'images_2') # './data/D2RF/Car/images_2'    
-    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+    if high:
+        imgdir = os.path.join(path, 'images_bokeh') # './data/D2RF/Car/images_bokeh'    
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera blur image & right camera blur image)
+    else:
+        imgdir = os.path.join(path, 'images_2') # './data/D2RF/Car/images_2'    
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')] # image path (left camera blur image & right camera blur image)
     imgdir_sharp = os.path.join(path, 'images') # './data/D2RF/Car/images'    
     imgfiles_sharp = [os.path.join(imgdir_sharp, f) for f in sorted(os.listdir(imgdir_sharp)) \
@@ -701,8 +717,11 @@ def readD2RFCameras(path, camera_scale=-1):
     motion_mask_files = [os.path.join(motion_mask_dir, f) for f in sorted(os.listdir(motion_mask_dir)) if f.endswith('png')] # motion mask path
 
     sh = imageio.imread(imgfiles[0]).shape # 400, 940, 3
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width in poses
-    poses[2, 4, :] = poses[2, 4, :] * 1./ 2 # change focal, image -> image_2
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width in poses; poses[:,4,0]: 400., 940., 723.199
+    if high:
+        poses[2, 4, :] = poses[2, 4, :] * 1./ 1. # change focal, image -> image_2; poses[:,4,0]: 800., 1280., 723.199
+    else:
+        poses[2, 4, :] = poses[2, 4, :] * 1./ 2. # change focal, image -> image_2; poses[:,4,0]: 400., 940., 361.599
     
     poses = np.concatenate([poses[:, 1:2, :], 
                             -poses[:, 0:1, :], 
@@ -724,16 +743,16 @@ def readD2RFCameras(path, camera_scale=-1):
 
     # poses = recenter_poses(poses) # FIXME Is it necessary?
 
-    height = poses[0,0,-1]     # height
-    width = poses[0,1,-1]      # width 
-    focal = poses[0,2,-1]      # focal
+    height = poses[0,0,-1]     # height: 400
+    width = poses[0,1,-1]      # width: 940
+    focal = poses[0,2,-1]      # focal: 361.599
                  
     FovY = focal2fov(focal, height)
     FovX = focal2fov(focal, width)
 
     K = np.array([
-        [focal, 0., width],
-        [0., focal, height],
+        [focal, 0., width/2],
+        [0., focal, height/2],
         [0., 0., 1.]
     ], dtype=np.float32)
 
@@ -750,12 +769,14 @@ def readD2RFCameras(path, camera_scale=-1):
         image_name = os.path.basename(img_path).split(".")[0] # 000000_left
 
         depth = np.load(depth_files[idx])
-        depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 400, 940
+        depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # Disparity, 400, 940
         depthv2 = np.load(depth_fine_files[idx])
         depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
         blur_map = np.load(blur_map_files[idx]) # small is sharp, 400, 940
+        blur_map = cv.resize(blur_map, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST)
         blur_map = 1 - (blur_map - blur_map.min()) / (blur_map.max() - blur_map.min()) # large is sharp
         motion_mask = np.array(Image.open(motion_mask_files[idx]))
+        motion_mask = cv.resize(motion_mask, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST)
         motion_mask = np.clip(motion_mask, 0.0, 1.0) # large is dynamic
 
         uid =  idx // 2             # colmap_id,    unsureness
@@ -791,8 +812,8 @@ def readD2RFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
  
-    # depth_point = False
-    depth_point =True
+    depth_point = False
+    # depth_point =True
     if depth_point:
         print("depth point!")
         ply_path = os.path.join(path, "depth_rgb_True.ply")
@@ -819,8 +840,10 @@ def readD2RFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
     pcd_max = pcd.points.max(0)
     pcd_min = pcd.points.min(0)
+    pcd_num = pcd.points.shape[0]
     print('final_pcd_max =', pcd_max)
     print('final_pcd_min =', pcd_min)
+    print('final_pcd_num =', pcd_num)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -832,14 +855,21 @@ def readD2RFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
 
 def readDyBluRFCameras(path, camera_scale=-1):
 
+    # high = True
+    high = False
     poses_arr = np.load(os.path.join(path, 'poses_bounds.npy')) # 48, 17; MARK: camera pose
 
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0]) # 3, 5, 48
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0]) # 3, 5, 48; poses[:,4,0]: 696., 1239., 716.985
     bds = poses_arr[:, -2:].transpose([1, 0]) # 2, 48
-   
-    imgdir = os.path.join(path, 'images_512x288') # blur image path, MARK: train image
-    imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
-                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    
+    if high:
+        imgdir = os.path.join(path, 'images') # blur image path, MARK: train image
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    else:
+        imgdir = os.path.join(path, 'images_512x288') # blur image path, MARK: train image
+        imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                    if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
     imgdir_inference = os.path.join(path, 'inference_images') # sharp image path, MARK: test image
     imgfiles_inference = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
                 if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
@@ -853,8 +883,11 @@ def readDyBluRFCameras(path, camera_scale=-1):
     motion_mask_files = [os.path.join(motion_mask_dir, f) for f in sorted(os.listdir(motion_mask_dir)) if f.endswith('png')] # motion mask path
 
     sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width
-    poses[2, 4, :] = poses[2, 4, :] * 1. / 2.5 # change focal
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width; poses[:,4,0]: 288., 512., 716.985
+    if high:
+        poses[2, 4, :] = poses[2, 4, :] * 1. / 1.0 # change focal; poses[:,4,0]: 720., 1280., 716.985
+    else:
+        poses[2, 4, :] = poses[2, 4, :] * 1. / 2.5 # change focal; poses[:,4,0]: 288., 512., 286.794
     
     poses = np.concatenate([poses[:, 1:2, :], 
                             -poses[:, 0:1, :], 
@@ -876,16 +909,16 @@ def readDyBluRFCameras(path, camera_scale=-1):
 
     # poses = recenter_poses(poses) # FIXME Is it necessary?
 
-    height = poses[0,0,-1]     # height
-    width = poses[0,1,-1]      # width 
-    focal = poses[0,2,-1]      # focal
+    height = poses[0,0,-1]     # height: 288
+    width = poses[0,1,-1]      # width: 512 
+    focal = poses[0,2,-1]      # focal: 286.794
                  
     FovY = focal2fov(focal, height)
     FovX = focal2fov(focal, width)
 
     K = np.array([
-        [focal, 0., width],
-        [0., focal, height],
+        [focal, 0., width/2],
+        [0., focal, height/2],
         [0., 0., 1.]
     ], dtype=np.float32)
 
@@ -894,12 +927,14 @@ def readDyBluRFCameras(path, camera_scale=-1):
         if idx % 2 == 0:
             img_path = imgfiles[idx // 2] # MARK: train image
             depth = np.load(depth_files[idx // 2])
-            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # absolute depth, 288, 512
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # disparity, 288, 512
             depthv2 = np.load(depth_fine_files[idx // 2])
             depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
             blur_map = np.load(blur_map_files[idx // 2]) # small is sharp, 288, 512
+            blur_map = cv.resize(blur_map, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST)
             blur_map = 1 - (blur_map - blur_map.min()) / (blur_map.max() - blur_map.min()) # large is sharp
             motion_mask = np.array(Image.open(motion_mask_files[idx // 2]))
+            motion_mask = cv.resize(motion_mask, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST)
             motion_mask = np.clip(motion_mask, 0.0, 1.0) # large is dynamic
         else:
             img_path = imgfiles_inference[idx // 2] # MARK: test image
@@ -1084,8 +1119,10 @@ def readDyBluRFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
     
     pcd_max = pcd.points.max(0)
     pcd_min = pcd.points.min(0)
+    pcd_num = pcd.points.shape[0]
     print('final_pcd_max =', pcd_max)
     print('final_pcd_min =', pcd_min)
+    print('final_pcd_num =', pcd_num)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -1095,6 +1132,703 @@ def readDyBluRFDataset(path, camera_scale=-1, eval = True, llffhold = 2):
                            sc=sc)
     return scene_info
 
+def readDeblur4DGSCameras(path, camera_scale=-1):
+
+    imgdir = os.path.join(path, 'images') # blur image path, MARK: train image
+    imgfiles_all = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles = imgfiles_all[::2]
+
+    imgdir_inference = os.path.join(path, 'images_test') # sharp image path, MARK: test image
+    imgfiles_inference_all = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles_inference = imgfiles_inference_all[1::2]
+
+    depth_dir = os.path.join(path, 'flow3d_preprocessed/aligned_depth_anything_colmap') # disparity
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
+    depth_files = depth_files[::2]
+    # depth_fine_dir = os.path.join(path, 'disp') # depth anything v2
+    # depth_fine_files = [os.path.join(depth_fine_dir, f) for f in sorted(os.listdir(depth_fine_dir)) if f.endswith('npy')] # depth map path
+    # blur_map_dir = os.path.join(path, 'blur_masks_npy') # DMENet
+    # blur_map_files = [os.path.join(blur_map_dir, f) for f in sorted(os.listdir(blur_map_dir)) if f.endswith('npy')] # blur map path
+    # motion_mask_dir = os.path.join(path, 'motion_masks') # motion mask
+    # motion_mask_files = [os.path.join(motion_mask_dir, f) for f in sorted(os.listdir(motion_mask_dir)) if f.endswith('png')] # motion mask path
+    blur_map_files = depth_files
+    motion_mask_files = depth_files
+
+    frame_names_all = [f.split('/')[-1].split('.')[0] for f in imgfiles_all] # '00000', '00001', '00002'
+    Ks, w2cs = get_colmap_camera_params( # 48, 4, 4
+        os.path.join(path, "flow3d_preprocessed/colmap/sparse/"),
+        [frame_name + ".png" for frame_name in frame_names_all],
+    )
+    # if path.split('/')[-2] == 'man':
+    #     Ks[[10,11,22,23,34,35,46,47]] = Ks[[11,10,23,22,35,34,47,46]]
+    #     w2cs[[10,11,22,23,34,35,46,47]] = w2cs[[11,10,23,22,35,34,47,46]]
+    Ks = torch.from_numpy(Ks[:, :3, :3].astype(np.float32)) # 48, 3, 3; f_x=f_y=666.057, w/2=640, h/2=360
+    if imageio.imread(imgfiles[0]).shape[0] == 720:
+        Ks[:, :2] /= 1.0 # f_x=f_y=666.057, w/2=640, h/2=360; MARK: high resolution
+    else:
+        Ks[:, :2] /= 2.5 # f_x=f_y=266.423, w/2=256, h/2=144; MARK: low resolution
+    w2cs = torch.from_numpy(w2cs.astype(np.float32)) # 48, 4, 4
+    c2ws = w2cs.inverse() # 48, 4, 4
+
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(10 * bd_factor)
+    else:
+        sc = camera_scale
+    c2ws[:,:3,3] *= sc # change camera center
+    print('sc =',sc)
+
+    sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
+
+    height = sh[0]      # height: 288
+    width = sh[1]       # width: 512
+    focal = Ks[0,0,0]   # focal: 266.423
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    cam_infos = []
+    for idx in range(len(c2ws)): 
+        if idx % 2 == 0:
+            img_path = imgfiles[idx // 2] # MARK: train image
+            depth = np.load(depth_files[idx // 2])
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # disparity; 288, 512
+            depth[depth < 1e-3] = 1e-3
+            depth = 1.0 / depth # disparity -> depth
+            # depthv2 = np.load(depth_fine_files[idx // 2])
+            # depthv2 = cv.resize(depthv2, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # depth anything v2
+            # blur_map = np.load(blur_map_files[idx // 2]) # small is sharp, 288, 512
+            # blur_map = 1 - (blur_map - blur_map.min()) / (blur_map.max() - blur_map.min()) # large is sharp
+            # motion_mask = np.array(Image.open(motion_mask_files[idx // 2]))
+            # motion_mask = np.clip(motion_mask, 0.0, 1.0) # large is dynamic
+            blur_map = np.ones(depth.shape) # 288, 512
+            motion_mask = np.ones(depth.shape) # 288, 512
+        else:
+            img_path = imgfiles_inference[idx // 2] # MARK: test image
+            # depth = None
+            # depthv2 = None
+            # blur_map = None
+            # motion_mask = None
+        img = Image.open(img_path) # 288, 512, 3
+        if img.size[0] != sh[1]:
+            img = img.resize((sh[1],sh[0])) # resize sharp
+        image_name = os.path.basename(img_path).split(".")[0] # 00000
+        
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = (idx // 2) / (len(c2ws) // 2)
+
+        c2w = c2ws[idx]                         # c2w, homogeneous coordinates               
+        matrix = np.linalg.inv(np.array(c2w))   # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])        # R in c2w, np.transpose(matrix[:3, :3]) == c2w[:3, :3]
+        T = matrix[:3, 3]                       # T in w2c
+        K = Ks[idx]
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, blur_map=blur_map,
+                              motion_mask=motion_mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_infos.append(cam_info)
+
+    return cam_infos, sc
+
+def readDeblur4DGSCameras_depth(path, camera_scale=-1):
+
+    imgdir = os.path.join(path, 'images') # blur image path, MARK: train image
+    imgfiles_all = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles = imgfiles_all[::2]
+
+    imgdir_inference = os.path.join(path, 'images_test') # sharp image path, MARK: test image
+    imgfiles_inference_all = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles_inference = imgfiles_inference_all[1::2]
+
+    depth_dir = "/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset/seesaw/dense/disp" # disparity
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
+
+    blur_map_files = depth_files
+    motion_mask_files = depth_files
+
+    frame_names_all = [f.split('/')[-1].split('.')[0] for f in imgfiles_all] # '00000', '00001', '00002'
+    Ks, w2cs = get_colmap_camera_params( # 48, 4, 4
+        os.path.join(path, "flow3d_preprocessed/colmap/sparse/"),
+        [frame_name + ".png" for frame_name in frame_names_all],
+    )
+
+    Ks = torch.from_numpy(Ks[:, :3, :3].astype(np.float32)) # 48, 3, 3; f_x=f_y=666.057, w/2=640, h/2=360
+    if imageio.imread(imgfiles[0]).shape[0] == 720:
+        Ks[:, :2] /= 1.0 # f_x=f_y=666.057, w/2=640, h/2=360; MARK: high resolution
+    else:
+        Ks[:, :2] /= 2.5 # f_x=f_y=266.423, w/2=256, h/2=144; MARK: low resolution
+    w2cs = torch.from_numpy(w2cs.astype(np.float32)) # 48, 4, 4
+    c2ws = w2cs.inverse() # 48, 4, 4
+
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(10 * bd_factor)
+    else:
+        sc = camera_scale
+    c2ws[:,:3,3] *= sc # change camera center
+    print('sc =',sc)
+
+    sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
+
+    height = sh[0]      # height: 288
+    width = sh[1]       # width: 512
+    focal = Ks[0,0,0]   # focal: 266.423
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    cam_infos = []
+    for idx in range(len(c2ws)): 
+        if idx % 2 == 0:
+            img_path = imgfiles[idx // 2] # MARK: train image
+            depth = np.load(depth_files[idx // 2])
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # disparity; 288, 512
+
+            blur_map = np.ones(depth.shape) # 288, 512
+            motion_mask = np.ones(depth.shape) # 288, 512
+        else:
+            img_path = imgfiles_inference[idx // 2] # MARK: test image
+        img = Image.open(img_path) # 288, 512, 3
+        if img.size[0] != sh[1]:
+            img = img.resize((sh[1],sh[0])) # resize sharp
+        image_name = os.path.basename(img_path).split(".")[0] # 00000
+        
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = (idx // 2) / (len(c2ws) // 2)
+
+        c2w = c2ws[idx]                         # c2w, homogeneous coordinates               
+        matrix = np.linalg.inv(np.array(c2w))   # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])        # R in c2w, np.transpose(matrix[:3, :3]) == c2w[:3, :3]
+        T = matrix[:3, 3]                       # T in w2c
+        K = Ks[idx]
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, blur_map=blur_map,
+                              motion_mask=motion_mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_infos.append(cam_info)
+
+    return cam_infos, sc
+
+def readDeblur4DGSCameras_pose(path, camera_scale=-1):
+
+    imgdir = os.path.join(path, 'images') # blur image path, MARK: train image
+    imgfiles_all = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles = imgfiles_all[::2]
+
+    imgdir_inference = os.path.join(path, 'images_test') # sharp image path, MARK: test image
+    imgfiles_inference_all = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    imgfiles_inference = imgfiles_inference_all[1::2]
+
+    depth_dir = os.path.join(path, 'flow3d_preprocessed/aligned_depth_anything_colmap') # disparity
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
+    depth_files = depth_files[::2]
+
+    poses_arr = np.load("/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset/seesaw/dense/poses_bounds.npy") # 48, 17; MARK: camera pose
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1, 2, 0]) # 3, 5, 48; poses[:,4,0]: 696., 1239., 716.985
+    bds = poses_arr[:, -2:].transpose([1, 0]) # 2, 48
+
+    sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1]) # change height and width; poses[:,4,0]: 288., 512., 716.985
+    poses[2, 4, :] = poses[2, 4, :] * 1. / 2.5 # change focal; poses[:,4,0]: 288., 512., 286.794
+    
+    poses = np.concatenate([poses[:, 1:2, :], 
+                            -poses[:, 0:1, :], 
+                            poses[:, 2:, :]], 1)            # llff (DRB) -> nerf (RUB)
+    poses = np.concatenate([poses[:, 0:1, :], 
+                            -poses[:, 1:3, :], 
+                            poses[:, 3:, :]], 1)            # nerf (RUB) -> colmap (RDF)
+    poses = np.moveaxis(poses, -1, 0).astype(np.float32)    # 48, 3, 5
+    bds = np.moveaxis(bds, -1, 0).astype(np.float32)        # 48, 2
+
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(10 * bd_factor)
+    else:
+        sc = camera_scale
+    poses[:,:3,3] *= sc # change camera center
+    bds *= sc
+    print('sc =',sc)
+
+    height = poses[0,0,-1]     # height: 288
+    width = poses[0,1,-1]      # width: 512 
+    focal = poses[0,2,-1]      # focal: 286.794
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    K = np.array([
+        [focal, 0., width/2],
+        [0., focal, height/2],
+        [0., 0., 1.]
+    ], dtype=np.float32)
+
+    cam_infos = []
+    for idx in range(len(poses)): 
+        if idx % 2 == 0:
+            img_path = imgfiles[idx // 2] # MARK: train image
+            depth = np.load(depth_files[idx // 2])
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # disparity; 288, 512
+            depth[depth < 1e-3] = 1e-3
+            depth = 1.0 / depth # disparity -> depth
+            blur_map = np.ones(depth.shape) # 288, 512
+            motion_mask = np.ones(depth.shape) # 288, 512
+        else:
+            img_path = imgfiles_inference[idx // 2] # MARK: test image
+        img = Image.open(img_path) # 288, 512, 3
+        if img.size[0] != sh[1]:
+            img = img.resize((sh[1],sh[0])) # resize sharp
+        image_name = os.path.basename(img_path).split(".")[0] # 00000
+        
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = (idx // 2) / (len(poses) // 2)
+
+        c2w = poses[idx, :3, :4]                
+        bottom = np.reshape([0,0,0,1.], [1,4])
+        c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # c2w, homogeneous coordinates
+        matrix = np.linalg.inv(np.array(c2w))           # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])            # R in c2w, np.transpose(matrix[:3, :3]) == c2w[:3, :3]
+        T = matrix[:3, 3]                           # T in w2c
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, blur_map=blur_map,
+                              motion_mask=motion_mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_infos.append(cam_info)
+
+    return cam_infos, sc
+
+def readDeblur4DGSDataset(path, camera_scale=-1, eval=True, llffhold=2):
+    
+    cam_infos_unsorted, sc = readDeblur4DGSCameras(path, camera_scale)
+    # cam_infos_unsorted, sc = readDeblur4DGSCameras_depth(path, camera_scale)
+    # cam_infos_unsorted, sc = readDeblur4DGSCameras_pose(path, camera_scale)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    if eval: # divide the training set and test set
+        train_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold == 0]
+        test_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold != 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
+
+    depth_point = False
+    # depth_point =True
+    if depth_point:
+        print("depth point!")
+        ply_path = os.path.join(path, "depth_rgb_True.ply")
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+    else:
+        print("sfm point!")
+        ply_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.ply") # NOTE sfm point cloud
+        # ply_path = "/home/xuankai/code/dydeblur/data/DyBluRF/stereo_blur_dataset/seesaw/dense/sparse_/points3D.ply" # NOTE sfm point cloud
+        bin_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.bin")
+        txt_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+
+    pcd_max = pcd.points.max(0)
+    pcd_min = pcd.points.min(0)
+    pcd_num = pcd.points.shape[0]
+    print('final_pcd_max =', pcd_max)
+    print('final_pcd_min =', pcd_min)
+    print('final_pcd_num =', pcd_num)
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           sc=sc)
+    return scene_info
+
+def readDyDeblurCameras(path, camera_scale=-1):
+    
+    imgdir = os.path.join(path, 'images') # blur image path, train image
+    imgfiles_all = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    # imgfiles = imgfiles_all[::2] # only train
+    imgfiles = imgfiles_all # only train
+
+    imgdir_inference = os.path.join(path, 'images_test') # sharp image path, test image
+    imgfiles_inference_all = [os.path.join(imgdir_inference, f) for f in sorted(os.listdir(imgdir_inference)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    # imgfiles_inference = imgfiles_inference_all[1::2] # only test
+    imgfiles_inference = imgfiles_inference_all # only test
+
+    maskdir = os.path.join(path, 'masks') # mask path
+    maskfiles_all = [os.path.join(maskdir, f) for f in sorted(os.listdir(maskdir)) \
+                if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+    # maskfiles = maskfiles_all[::2] # only train
+    maskfiles = maskfiles_all # only train
+
+    depth_dir = os.path.join(path, 'flow3d_preprocessed/aligned_depth_anything_colmap') # disparity
+    depth_files = [os.path.join(depth_dir, f) for f in sorted(os.listdir(depth_dir)) if f.endswith('npy')] # depth map path
+    # depth_files = depth_files[::2] # only train
+    depth_files = depth_files # only train
+
+    # frame_names_all = [f.split('/')[-1].split('.')[0] for f in imgfiles_all] # '00000', '00001', '00002'
+    frame_names_all = ["%05d"%i for i in range(2*len(imgfiles))] # dyblurf; '00000', '00001', '00002'
+    Ks, w2cs = get_colmap_camera_params( # 48, 4, 4
+        os.path.join(path, "flow3d_preprocessed/colmap/sparse/"),
+        [frame_name + ".png" for frame_name in frame_names_all],
+    )
+    Ks = torch.from_numpy(Ks[:, :3, :3].astype(np.float32)) # 48, 3, 3; f_x=f_y=666.057, w/2=640, h/2=360
+    # optimization Ks
+    h, w = imageio.imread(imgfiles[0]).shape[:2]
+    hx2, wx2 = h/2, w/2
+    virtual_hx2, virtual_wx2, virtual_fx2 = Ks[0,1,2], Ks[0,0,2], Ks[0,0,0]
+    real_fx2 = virtual_fx2 * ((hx2/virtual_hx2)+(wx2/virtual_wx2)) / 2
+    Ks[:,1,2], Ks[:,0,2], Ks[:,0,0], Ks[:,1,1] = hx2, wx2, real_fx2, real_fx2
+
+    # if (imageio.imread(imgfiles[0]).shape[0] == 720) or (imageio.imread(imgfiles[0]).shape[0] == 800):
+    #     Ks[:, :2] /= 1.0 # f_x=f_y=666.057, w/2=640, h/2=360; MARK: high resolution
+    # elif (imageio.imread(imgfiles[0]).shape[1] == 940): # d2rf
+    #     Ks[:, :2] /= 2.0        
+    # else:
+    #     Ks[:, :2] /= 2.5 # f_x=f_y=266.423, w/2=256, h/2=144; MARK: low resolution
+    w2cs = torch.from_numpy(w2cs.astype(np.float32)) # 48, 4, 4
+    c2ws = w2cs.inverse() # 48, 4, 4
+
+    if camera_scale == -1.:
+        bd_factor = 0.9
+        sc =  1./(10 * bd_factor)
+    else:
+        sc = camera_scale
+    c2ws[:,:3,3] *= sc # change camera center
+    w2cs = c2ws.inverse() # 48, 4, 4; MARK: new w2cs
+    print('sc =',sc)
+
+    sh = imageio.imread(imgfiles[0]).shape # 288, 512, 3
+
+    height = sh[0]      # height: 288
+    width = sh[1]       # width: 512
+    focal = Ks[0,0,0]   # focal: 266.423
+                 
+    FovY = focal2fov(focal, height)
+    FovX = focal2fov(focal, width)
+
+    depth_no_scale = []
+    for idx in range(len(c2ws)): 
+        if idx % 2 == 0:
+            depth = np.load(depth_files[idx // 2])
+            depth = cv.resize(depth, (sh[1],sh[0]), interpolation=cv.INTER_NEAREST) # disparity; 288, 512
+            depth[depth < 1e-3] = 1e-3
+            depth = 1.0 / depth # disparity -> depth 
+            depth_no_scale.append(depth)
+    depth_no_scale = np.array(depth_no_scale) # 24, 288, 512
+    max_depth_values_per_frame = depth_no_scale.reshape(depth_no_scale.shape[0], -1).max(1) # (24,)
+    max_depth_value = np.median(max_depth_values_per_frame) * 2.5 # 806.776
+    depth_no_scale = np.clip(depth_no_scale, 0, max_depth_value) # 24, 288, 512; limit depth range
+    depth_scale = depth_no_scale * sc # 24, 288, 512; change depth
+    # depth_scale = depth_no_scale * 0.01 # 24, 288, 512; change depth
+
+
+    cam_infos = []
+    images, depths, masks, image_names = [], [], [], []
+    for idx in range(len(c2ws)): 
+        if idx % 2 == 0:
+            img_path = imgfiles[idx // 2] # MARK: train image
+            mask = np.array(Image.open(maskfiles[idx // 2])) / 255.
+            if mask.shape[-1] == 3: # 288, 512, 3
+                mask = mask[:, :, 0] # 288, 512
+            depth = depth_scale[idx // 2]
+            depth_no_sc = depth_no_scale[idx // 2]
+
+            blur_map = np.ones(depth.shape) # 288, 512
+            motion_mask = np.ones(depth.shape) # 288, 512
+        else:
+            img_path = imgfiles_inference[idx // 2] # MARK: test image
+
+        img = Image.open(img_path) # 288, 512, 3
+        if img.size[0] != sh[1]:
+            img = img.resize((sh[1],sh[0])) # resize sharp
+        image_name = os.path.basename(img_path).split(".")[0] # 00000
+        
+        uid =  idx // 2             # colmap_id,    unsureness
+        fid = (idx // 2) / (len(c2ws) // 2)
+
+        c2w = c2ws[idx]                         # c2w, homogeneous coordinates               
+        matrix = np.linalg.inv(np.array(c2w))   # w2c, homogeneous coordinates
+        R = np.transpose(matrix[:3, :3])        # R in c2w, np.transpose(matrix[:3, :3]) == c2w[:3, :3]
+        T = matrix[:3, 3]                       # T in w2c
+        K = Ks[idx]
+
+        cam_info = CameraInfo(uid=uid, R=R, T=T, K=K, FovY=np.array(FovY), FovX=np.array(FovX), image=img, depth=depth, blur_map=blur_map, depth_no_sc=depth_no_sc, 
+                              motion_mask=mask, image_path=img_path, image_name=image_name, width=int(width), height=int(height), fid=fid)
+        cam_infos.append(cam_info)
+
+        if idx % 2 == 0: # train
+            images.append(np.array(img)) # np.array(img).shape: 288, 512, 3
+            depths.append(depth)
+            masks.append(mask)
+            image_names.append(image_name)
+    
+    track_dir = os.path.join(path, 'flow3d_preprocessed/2d_tracks') # 2d_track
+    
+    query_tracks_2d, foreground_points = get_foreground(track_dir, images, depths, masks, Ks, c2ws, image_names, num_samples=40_000) # foreground & background
+    background_points = get_background(images, depths, masks, Ks, w2cs, num_samples=100_000)
+    # static_masks = [1 - x for x in masks]
+    # foreground_points = get_background(images, depths, static_masks, Ks, w2cs, num_samples=100_000)
+    # tracks_3d = TrackObservations()
+                                  
+    return cam_infos, foreground_points, background_points, Ks, w2cs, sc
+
+def readDyDeblurDataset(path, camera_scale=-1, eval=True, llffhold=2):
+    
+    cam_infos_unsorted, foreground_points, background_points, Ks, w2cs, sc = readDyDeblurCameras(path, camera_scale) # image, image_test, camera, depth, track_3d
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    if eval: # divide the training set and test set
+        train_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold == 0]
+        test_cam_infos = [c for idx, c in enumerate(
+            cam_infos) if idx % llffhold != 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos) # average camera center, diagonal
+
+    ply_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.ply") # NOTE sfm point cloud
+    bin_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.bin")
+    txt_path = os.path.join(path, "flow3d_preprocessed/colmap/sparse/points3D.txt")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path, 
+                           sc=sc,
+                           foreground_points=foreground_points,
+                           background_points=background_points,
+                           Ks=Ks, 
+                           w2cs=w2cs)
+    return scene_info
+
+def get_foreground(track_dir, images, depths, masks, Ks, c2ws, image_names, num_samples: int, step: int = 1):
+
+    # load checkpoint
+    # cached_track_3d_path = osp.join(self.cache_dir, f"tracks_3d_{num_samples}.pth")
+    # if osp.exists(cached_track_3d_path) and step == 1 and self.load_from_cache: # when 'step == 1', load cache 3d track data
+    #     print("loading cached 3d tracks data...")
+    #     start, end = self.start, self.end
+    #     cached_track_3d_data = torch.load(cached_track_3d_path)
+    #     tracks_3d, visibles, invisibles, confidences, track_colors = (
+    #         cached_track_3d_data["tracks_3d"][:, start:end],
+    #         cached_track_3d_data["visibles"][:, start:end],
+    #         cached_track_3d_data["invisibles"][:, start:end],
+    #         cached_track_3d_data["confidences"][:, start:end],
+    #         cached_track_3d_data["track_colors"],
+    #     )
+    #     return tracks_3d, visibles, invisibles, confidences, track_colors
+
+    # load query_tracks_2d
+    c2ws = c2ws[::2] # only train
+    Ks = Ks[::2] # only train
+    track_files = [os.path.join(track_dir, f) for f in sorted(os.listdir(track_dir)) if f.endswith('npy')]
+    query_tracks_2d_files = [f"{frame_name}_{frame_name}.npy" for frame_name in image_names] # frame i -> frame i
+    query_tracks_2d = [np.load(os.path.join(track_dir, f)).astype(np.float32) for f in query_tracks_2d_files] # 24, n_j, 4
+
+    # Load 2D tracks.
+    raw_tracks_2d = []
+    num_frames = len(c2ws) # 24
+    candidate_frames = list(range(0, num_frames, step)) # [0, 1, ..., 23]
+    num_sampled_frames = len(candidate_frames) # 24
+    for i in candidate_frames:
+        curr_num_samples = query_tracks_2d[i].shape[0] # reference frame
+        num_samples_per_frame = (
+            int(np.floor(num_samples / num_sampled_frames)) # 416
+            if i != candidate_frames[-1]
+            else num_samples
+            - (num_sampled_frames - 1)
+            * int(np.floor(num_samples / num_sampled_frames))
+        )
+        if num_samples_per_frame < curr_num_samples:
+            track_sels = np.random.choice(
+                curr_num_samples, (num_samples_per_frame,), replace=False
+            ) # track_sels is index
+        else:
+            track_sels = np.arange(0, curr_num_samples) # track_sels is index
+        curr_tracks_2d = [] # 24, 416, 4
+        for j in range(0, num_frames, step): # [0, 1, ..., 23]
+            if i == j:
+                target_tracks_2d = query_tracks_2d[i] # 3113, 4
+            else:
+                # target_tracks_2d = np.load(track_files[i*num_frames*2+j]).astype(np.float32)
+                target_tracks_2d = np.load(track_files[i*num_frames+j]).astype(np.float32)
+            curr_tracks_2d.append(target_tracks_2d[track_sels]) # 24, n_j, 4
+        raw_tracks_2d.append(np.stack(curr_tracks_2d, axis=1)) # 24, n_j, 24, 4
+
+    # Process 3D tracks.
+    inv_Ks = torch.linalg.inv(Ks)[::step] # 24, 3, 3
+    H, W, _ = images[0].shape # 288, 512
+    filtered_tracks_3d, filtered_visibles, filtered_track_colors = [], [], []
+    filtered_invisibles, filtered_confidences = [], []
+    masks = np.array(masks) * (np.array(depths) > 0) # 24, 288, 512; refine mask
+    masks = (masks > 0.5).astype(float) # Binarization
+    for i, tracks_2d in enumerate(raw_tracks_2d): # raw_tracks_2d: 24, n_j, 24, 4
+        tracks_2d = torch.tensor(tracks_2d).swapdims(0, 1) # n_j, 24, 4 -> 24, n_j, 4
+        tracks_2d, occs, dists = ( # tracks_2d: 24, n_j, 2; occs: 24, n_j; dists: 24, n_j;
+            tracks_2d[..., :2],
+            tracks_2d[..., 2],
+            tracks_2d[..., 3],
+        )
+        # visibles = postprocess_occlusions(occs, dists)
+        visibles, invisibles, confidences = parse_tapir_track_info(occs, dists) # 24, n_j; parse TAPIR track information
+        # Unproject 2D tracks to 3D.
+        track_depths = F.grid_sample( # 24, n_j, 1; Sampling from the depth map
+            torch.tensor(np.array(depths))[::step, None].float(), # 24, 1, 288, 512
+            normalize_coords(tracks_2d[..., None, :], H, W), # tracks_2d[..., None, :]: 24, n_j, 2 -> 24, n_j, 1, 2
+            align_corners=True,
+            padding_mode="border",
+        )[:, 0] # 24, 1, n_j, 1 -> 24, n_j, 1
+        tracks_3d = ( # 24, n_j, 3; 2D pixel system -> 3D camera system
+            torch.einsum(
+                "nij,npj->npi",
+                inv_Ks,
+                F.pad(tracks_2d, (0, 1), value=1.0), # 24, n_j, 2 -> 24, n_j, 3
+            )
+            * track_depths
+        )
+        tracks_3d = torch.einsum( # 24, n_j, 3; 3D camera system -> 3D world system
+            "nij,npj->npi", c2ws, F.pad(tracks_3d, (0, 1), value=1.0) # 24, n_j, 3 -> 24, n_j, 4
+        )[..., :3] # 24, n_j, 4 -> 24, n_j, 3
+        # Filter out out-of-mask tracks.
+        is_in_masks = ( # 24, n_j; valid dynamic mask
+            F.grid_sample(
+                torch.tensor(np.array(masks))[::step, None].float(), # 24, 1, 288, 512; mask = dynamic_mask && valid_mask
+                normalize_coords(tracks_2d[..., None, :], H, W), # tracks_2d[..., None, :]: 10, 1000, 2 -> 10, 1000, 1, 2
+                align_corners=True,
+            ).squeeze() # squeeze(): 24, 1, n_j, 1 -> 24, n_j
+            == 1
+        )
+        visibles *= is_in_masks             # 24, n_j; Eliminate static area tracking points, Keep dynamic area tracking points
+        invisibles *= is_in_masks           # 24, n_j
+        confidences *= is_in_masks.float()  # 24, n_j
+        # Get track's color from the query frame.
+        track_colors = ( # n_j, 3; Sampling from the color map
+            F.grid_sample( # 1, 3, 1, n_j
+                torch.tensor(np.array(images[i * step : i * step + 1])).permute(0, 3, 1, 2).float() / 255., # 1, 3, 288, 512; NOTE image 255 process
+                normalize_coords(tracks_2d[i : i + 1, None, :], H, W), # tracks_2d[i : i + 1, None, :]: 24, n_j, 2 -> 1, 1, n_j, 2
+                align_corners=True,
+                padding_mode="border",
+            )
+            .squeeze() # 1, 3, 1, n_j -> 3, n_j 
+            .T # 3, n_j -> n_j, 3
+        )
+        # at least visible 5% of the time, otherwise discard
+        visible_counts = visibles.sum(0) # (n_j,); num of subframes of visible track
+        valid = visible_counts >= min( # valid track trace
+            int(0.05 * num_frames),
+            visible_counts.float().quantile(0.1).item(), # strange: 0
+        )
+
+        filtered_tracks_3d.append(tracks_3d[:, valid])      # 24, 24, n_j_new, 3
+        filtered_visibles.append(visibles[:, valid])        # 24, 24, n_j_new
+        filtered_invisibles.append(invisibles[:, valid])    # 24, 24, n_j_new
+        filtered_confidences.append(confidences[:, valid])  # 24, 24, n_j_new
+        filtered_track_colors.append(track_colors[valid])   # 24, n_j_new, 3
+
+    filtered_tracks_3d = torch.cat(filtered_tracks_3d, dim=1).swapdims(0, 1)        # n_all, 24, 3
+    filtered_visibles = torch.cat(filtered_visibles, dim=1).swapdims(0, 1)          # n_all, 24
+    filtered_invisibles = torch.cat(filtered_invisibles, dim=1).swapdims(0, 1)      # n_all, 24
+    filtered_confidences = torch.cat(filtered_confidences, dim=1).swapdims(0, 1)    # n_all, 24
+    filtered_track_colors = torch.cat(filtered_track_colors, dim=0)                 # n_all, 3
+
+    return query_tracks_2d, (
+        filtered_tracks_3d,
+        filtered_visibles,
+        filtered_invisibles,
+        filtered_confidences,
+        filtered_track_colors,
+    )
+
+def get_background(images, depths, masks, Ks, w2cs, num_samples) :
+    H, W, _ = images[0].shape
+    w2cs = w2cs[::2] # 24, 4, 4; only train
+    Ks = Ks[::2] # 24, 3, 3; only train
+    grid = torch.stack(
+        torch.meshgrid(
+            torch.arange(W, dtype=torch.float32),
+            torch.arange(H, dtype=torch.float32),
+            indexing="xy",
+        ),
+        dim=-1,
+    )
+    num_frames = len(images) # 24
+    candidate_frames = list(range(num_frames)) # [0, 1, ..., 23]
+    num_sampled_frames = len(candidate_frames)
+    bkgd_points, bkgd_point_normals, bkgd_point_colors = [], [], []
+    for i in candidate_frames:
+        img = torch.tensor(images[i]) # 288, 512, 3
+        depth = torch.tensor(depths[i]) # 288, 512
+        bool_mask = ((1.0 - torch.tensor(masks[i])) * (depth > 0)).to(torch.bool) # valid static mask
+        w2c = w2cs[i]
+        K = Ks[i]
+        points = ( # n_i, 3
+            torch.einsum(
+                "ij,pj->pi",
+                torch.linalg.inv(K),
+                F.pad(grid[bool_mask], (0, 1), value=1.0),
+            )
+            * depth[bool_mask][:, None]
+        )
+        points = torch.einsum( # n_i, 3
+            "ij,pj->pi", torch.linalg.inv(w2c.double())[:3], F.pad(points, (0, 1), value=1.0)
+        )
+        point_normals = normal_from_depth_image(depth, K, w2c)[bool_mask] # n_i, 3
+        point_colors = img[bool_mask] / 255. # n_i, 3; NOTE image 255 process
+        curr_num_samples = points.shape[0]
+        num_samples_per_frame = (
+            int(np.floor(num_samples / num_sampled_frames))
+            if i != candidate_frames[-1]
+            else num_samples
+            - (num_sampled_frames - 1)
+            * int(np.floor(num_samples / num_sampled_frames))
+        )
+        if num_samples_per_frame < curr_num_samples:
+            point_sels = np.random.choice(
+                curr_num_samples, (num_samples_per_frame,), replace=False
+            )
+        else:
+            point_sels = np.arange(0, curr_num_samples)
+        bkgd_points.append(points[point_sels])
+        bkgd_point_normals.append(point_normals[point_sels])
+        bkgd_point_colors.append(point_colors[point_sels])
+    bkgd_points = torch.cat(bkgd_points, dim=0)
+    bkgd_point_normals = torch.cat(bkgd_point_normals, dim=0)
+    bkgd_point_colors = torch.cat(bkgd_point_colors, dim=0)
+
+    return (bkgd_points, bkgd_point_normals, bkgd_point_colors)
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,  # colmap dataset reader from official 3D Gaussian [https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/]
@@ -1104,4 +1838,6 @@ sceneLoadTypeCallbacks = {
     "plenopticVideo": readPlenopticVideoDataset,  # Neural 3D dataset in [https://github.com/facebookresearch/Neural_3D_Video]
     "D2RF": readD2RFDataset, # D2RF dataset in [https://github.com/xianrui-luo/D2RF]
     "DyBluRF": readDyBluRFDataset, # DyBluRF dataset in [https://github.com/huiqiang-sun/DyBluRF]
+    "Deblur4DGS": readDeblur4DGSDataset, # Deblur4DGS dataset in [https://github.com/ZcsrenlongZ/Deblur4DGS]
+    "DyDeblur": readDyDeblurDataset,
 }

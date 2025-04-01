@@ -13,12 +13,14 @@ import os
 import random
 import json
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from scene.deform_model import DeformModel
+from scene.motion_model import MotionBases
 from scene.mlp_model import MLP
 from scene.blur_model import Blur
 from scene.cameras import Camera
@@ -26,6 +28,7 @@ from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.graphics_utils import getWorld2View, focal2fov
 from utils.pose_utils import viewmatrix, posevisual
+from utils.loss_utils import project_2d_tracks, masked_l1_loss, compute_se3_smoothness_loss, compute_accel_loss, compute_z_acc_loss
 
 from simple_lama_inpainting import SimpleLama
 from utils.warp_utils import Warper
@@ -84,6 +87,14 @@ class Scene:
             print("Found sharp_images, assuming DyBluRF data set!")
             scene_info = sceneLoadTypeCallbacks["DyBluRF"](args.source_path, args.camera_scale) # DyBluRF
 
+        elif os.path.exists(os.path.join(args.source_path, "flow3d_preprocessed")):
+            print("Found flow3d_preprocessed, assuming Deblur4DGS data set!")
+        #     scene_info = sceneLoadTypeCallbacks["Deblur4DGS"](args.source_path, args.camera_scale) # Deblur4DGS
+
+        # elif os.path.exists(os.path.join(args.source_path, "DyDeblur")):
+        #     print("DyDeblur, assuming DyDeblur data set!")
+            scene_info = sceneLoadTypeCallbacks["DyDeblur"](args.source_path, args.camera_scale) # DyDeblur
+
         elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")):
             print("Found calibration_full.json, assuming Neu3D data set!")
             scene_info = sceneLoadTypeCallbacks["plenopticVideo"](args.source_path, args.eval, 24) # Neu3D, DyNeRF
@@ -139,9 +150,145 @@ class Scene:
                                                  "iteration_" + str(self.loaded_iter),
                                                  "point_cloud.ply"),
                                     og_number_points=len(scene_info.point_cloud.points))
+        # elif os.path.exists(os.path.join(args.source_path, "DyDeblur")):
+        elif os.path.exists(os.path.join(args.source_path, "flow3d_preprocessed")):
+            print("DyDeblur, assuming DyDeblur data set!")
+            fg_params, motion_bases, bg_params, tracks_3d = self.gaussians.depth_track_point(scene_info.foreground_points, scene_info.background_points, args.canot)
+            self.run_initial_optim(fg_params, motion_bases, tracks_3d, scene_info.Ks, scene_info.w2cs, num_iters=1000) # tracks_3d is gt; 1000
+            self.motion_model = motion_bases # deform model
+            # TODO add depth foregroud
+            # init gaussian
+            self.gaussians.create_from_track(fg_params, bg_params, args.gaussian_spatial_lr_scale) # self.cameras_extent
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, args.gaussian_spatial_lr_scale) # self.cameras_extent
 
+    def run_initial_optim(self, fg, bases, tracks_3d, Ks, w2cs, num_iters, use_depth_range_loss=False):
+
+        w2cs = w2cs[::2] # 24, 4, 4
+        Ks = Ks[::2] # 24, 3, 3
+        optimizer = torch.optim.Adam(
+            [
+                {"params": bases.params["rots"], "lr": 1e-2},
+                {"params": bases.params["transls"], "lr": 3e-2},
+                {"params": fg.params["motion_coefs"], "lr": 1e-2},
+                {"params": fg.params["means"], "lr": 1e-3},
+            ],
+        )
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=0.1 ** (1 / num_iters)
+        )
+        G = fg.params.means.shape[0] # 7392
+        num_frames = bases.num_frames # 24
+        device = bases.params["rots"].device
+
+        w_smooth_func = lambda i, min_v, max_v, th: (
+            min_v if i <= th else (max_v - min_v) * (i - th) / (num_iters - th) + min_v
+        )
+
+        gt_2d, gt_depth = project_2d_tracks(
+            tracks_3d.xyz.swapaxes(0, 1), Ks, w2cs, return_depth=True
+        )
+        # (G, T, 2)
+        gt_2d = gt_2d.swapaxes(0, 1)
+        # (G, T)
+        gt_depth = gt_depth.swapaxes(0, 1)
+
+        ts = torch.arange(0, num_frames, device=device) # [0, 1, ..., 23]
+        ts_clamped = torch.clamp(ts, min=1, max=num_frames - 2)
+        ts_neighbors = torch.cat((ts_clamped - 1, ts_clamped, ts_clamped + 1))  # i (3B,)
+
+        # def get_coefs(self) -> torch.Tensor:
+        #     assert "motion_coefs" in self.params
+        #     return self.motion_coef_activation(self.params["motion_coefs"])
+        # self.motion_coef_activation = lambda x: F.softmax(x, dim=-1)
+
+        get_coefs = lambda x: F.softmax(x, dim=-1)
+        
+        pbar = tqdm(range(0, num_iters))
+        for i in pbar:
+            coefs = get_coefs(fg.params["motion_coefs"])
+            transfms = bases.compute_transforms(ts, coefs)
+            positions = torch.einsum(
+                "pnij,pj->pni",
+                transfms,
+                F.pad(fg.params["means"], (0, 1), value=1.0),
+            )
+
+            loss = 0.0
+            track_3d_loss = masked_l1_loss(
+                positions,
+                tracks_3d.xyz.cuda(),
+                (tracks_3d.visibles.cuda().float() * tracks_3d.confidences.cuda())[..., None],
+            )
+            loss += track_3d_loss * 1.0
+
+            pred_2d, pred_depth = project_2d_tracks(
+                positions.swapaxes(0, 1), Ks.cuda(), w2cs.cuda(), return_depth=True
+            )
+            pred_2d = pred_2d.swapaxes(0, 1)
+            pred_depth = pred_depth.swapaxes(0, 1)
+
+            loss_2d = (
+                masked_l1_loss(
+                    pred_2d,
+                    gt_2d.cuda(),
+                    (tracks_3d.invisibles.cuda().float() * tracks_3d.confidences.cuda())[..., None],
+                    quantile=0.95,
+                )
+                / Ks.cuda()[0, 0, 0]
+            )
+            loss += 0.5 * loss_2d
+
+            if use_depth_range_loss:
+                near_depths = torch.quantile(gt_depth, 0.0, dim=0, keepdim=True)
+                far_depths = torch.quantile(gt_depth, 0.98, dim=0, keepdim=True)
+                loss_depth_in_range = 0
+                if (pred_depth < near_depths).any():
+                    loss_depth_in_range += (near_depths - pred_depth)[
+                        pred_depth < near_depths
+                    ].mean()
+                if (pred_depth > far_depths).any():
+                    loss_depth_in_range += (pred_depth - far_depths)[
+                        pred_depth > far_depths
+                    ].mean()
+
+                loss += loss_depth_in_range * w_smooth_func(i, 0.05, 0.5, 400)
+
+            motion_coef_sparse_loss = 1 - (coefs**2).sum(dim=-1).mean()
+            loss += motion_coef_sparse_loss * 0.01
+
+            # motion basis should be smooth.
+            w_smooth = w_smooth_func(i, 0.01, 0.1, 400)
+            small_acc_loss = compute_se3_smoothness_loss(
+                bases.params["rots"], bases.params["transls"]
+            )
+            loss += small_acc_loss * w_smooth
+
+            small_acc_loss_tracks = compute_accel_loss(positions)
+            loss += small_acc_loss_tracks * w_smooth * 0.5
+
+            transfms_nbs = bases.compute_transforms(ts_neighbors, coefs)
+            means_nbs = torch.einsum(
+                "pnij,pj->pni", transfms_nbs, F.pad(fg.params["means"], (0, 1), value=1.0)
+            )  # (G, 3n, 3)
+            means_nbs = means_nbs.reshape(means_nbs.shape[0], 3, -1, 3)  # [G, 3, n, 3]
+            z_accel_loss = compute_z_acc_loss(means_nbs, w2cs.cuda())
+            loss += z_accel_loss * 0.1
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            pbar.set_description(
+                f"{loss.item():.3f} "
+                f"{track_3d_loss.item():.3f} "
+                f"{motion_coef_sparse_loss.item():.3f} "
+                f"{small_acc_loss.item():.3f} "
+                f"{small_acc_loss_tracks.item():.3f} "
+                f"{z_accel_loss.item():.3f} "
+            )
+    
     def save(self, iteration, starttime, operate, best=False):
         if not best:
             point_cloud_path = os.path.join(self.model_path, operate, starttime[:16], "point_cloud/iteration_{}".format(iteration))
@@ -193,7 +340,7 @@ class Scene:
                 in tqdm(zip(input_batches, target_batches), desc="Unseen view prior", unit="batch", total=int(len(input_imgs) / batch_size)):
                 torch.cuda.empty_cache()
                 masks_batch = None
-                # get priors for unseen views by forward warping
+                # get priors for unseen views by forward warping; MARK: mvs_depths: disparity
                 warped_frame, valid_mask, warped_depth, _ = warper.forward_warp(input_imgs_batch, masks_batch, mvs_depths_batch, input_extrs_batch, 
                                                                                 target_extrs_batch, input_intrs_batch, target_intrs_batch)
                 warped_frames.append(warped_frame.cpu()) # batch_size, 3, 288, 512
@@ -261,13 +408,13 @@ class Scene:
             focal_length_x, focal_length_y = target_intrs[i][0,0], target_intrs[i][1,1]
             H, W = warped_frames.shape[2:4]
             K = np.array([
-                [focal_length_x, 0., W],
-                [0., focal_length_y, H],
+                [focal_length_x, 0., W/2],
+                [0., focal_length_y, H/2],
                 [0., 0., 1.]
             ], dtype=np.float32)
             FovY = focal2fov(focal_length_y, H)
             FovX = focal2fov(focal_length_x, W)
-            depth = warped_depths[i].cpu().numpy().squeeze(0)
+            depth = warped_depths[i].cpu().numpy().squeeze(0) * sc # depth scale
 
             warped_img = warped_frames[i] # 3, 288, 512
             mask = valid_masks[i].squeeze().to(torch.bool).detach().cpu().numpy() # 288, 512
@@ -320,25 +467,32 @@ class Scene:
         input_imgs = torch.stack([input_cams[id].original_image for id in ids]) # v_num, 3, 288, 512
         input_blur_maps = torch.stack([input_cams[id].blur_map for id in ids]).unsqueeze(1).repeat(1, 3, 1, 1) # v_num, 3, 288, 512
         input_motion_masks = torch.stack([input_cams[id].motion_mask for id in ids]).unsqueeze(1).repeat(1, 3, 1, 1) # v_num, 3, 288, 512
-        mvs_depths = torch.from_numpy(np.stack([input_cams[id].depth.cpu() for id in ids])).unsqueeze(1) # v_num, 1, 288, 512
+        if input_cams[0].depth_no_sc is None:
+            mvs_depths = torch.from_numpy(np.stack([input_cams[id].depth.cpu() for id in ids])).unsqueeze(1) # v_num, 1, 288, 512
+        else:
+            mvs_depths = torch.from_numpy(np.stack([input_cams[id].depth_no_sc.cpu() for id in ids])).unsqueeze(1) # v_num, 1, 288, 512
         input_extrs = torch.from_numpy(np.stack([self.getWorld2View2(input_cams[id].R, input_cams[id].T, sc) for id in ids])) # v_num, 4, 4
         input_intrs = torch.from_numpy(np.stack([input_cams[id].K for id in ids])) # v_num, 3, 3
 
-        # target_extrs = torch.from_numpy(np.stack([self.getWorld2View2(target_cams[id].R, target_cams[id].T, sc) for id in ids])) # v_num, 4, 4
-        # target_intrs = torch.from_numpy(np.stack([target_cams[id].K for id in ids])) # v_num, 3, 3
-
+        # target pose
         parallel_poses = torch.from_numpy(parallel_trajectory_interpolation(input_extrs)) # c2w
         parallel_extrs = torch.from_numpy(np.stack([np.linalg.inv(parallel_poses[i]) for i in range(parallel_poses.shape[0])])) # w2c
         parallel_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(parallel_extrs)))  # same intrinsics
-        vertical_poses = torch.from_numpy(vertical_trajectory_interpolation(input_extrs, right=0., left=0.)) # c2w
+        vertical_poses = torch.from_numpy(vertical_trajectory_interpolation(input_extrs, right=0., left=0., radiu=0.5)) # c2w
         vertical_extrs = torch.from_numpy(np.stack([np.linalg.inv(vertical_poses[i]) for i in range(vertical_poses.shape[0])])) # w2c
         vertical_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(vertical_extrs)))  # same intrinsics
-        # central_poses = torch.from_numpy(central_interpolation(input_extrs, right=0., left=0.)) # c2w
+        # central_poses = torch.from_numpy(central_interpolation(input_extrs, right=0., left=0., radiu=1.0)) # c2w
         # central_extrs = torch.from_numpy(np.stack([np.linalg.inv(central_poses[i]) for i in range(central_poses.shape[0])])) # w2c
         # central_intrs = torch.from_numpy(np.stack([input_cams[0].K] * len(central_extrs)))  # same intrinsics
 
         # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...], \
         #                         input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE all 
+        # input_blur_maps = torch.cat([input_blur_maps[:-1,...], input_blur_maps[1:,...], input_blur_maps[:-1,...], input_blur_maps[:-1,...], \
+        #                              input_blur_maps[1:,...], input_blur_maps[1:,...], input_blur_maps[:-1,...], input_blur_maps[:-1,...], \
+        #                              input_blur_maps[1:,...], input_blur_maps[1:,...]], dim=0).cpu()
+        # input_motion_masks = torch.cat([input_motion_masks[:-1,...], input_motion_masks[1:,...], input_motion_masks[:-1,...], input_motion_masks[:-1,...], \
+        #                                 input_motion_masks[1:,...], input_motion_masks[1:,...], input_motion_masks[:-1,...], input_motion_masks[:-1,...], \
+        #                                 input_motion_masks[1:,...], input_motion_masks[1:,...]], dim=0).cpu()
         # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...], \
         #                         mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
         # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...], \
@@ -349,6 +503,10 @@ class Scene:
         # target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs, central_intrs], dim=0)
 
         # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE only_pv
+        # input_blur_maps = torch.cat([input_blur_maps[:-1,...], input_blur_maps[1:,...], input_blur_maps[:-1,...], input_blur_maps[:-1,...], \
+        #                              input_blur_maps[1:,...], input_blur_maps[1:,...]], dim=0).cpu()
+        # input_motion_masks = torch.cat([input_motion_masks[:-1,...], input_motion_masks[1:,...], input_motion_masks[:-1,...], input_motion_masks[:-1,...], \
+        #                                 input_motion_masks[1:,...], input_motion_masks[1:,...]], dim=0).cpu()
         # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
         # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...]], dim=0)
         # input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...]], dim=0)
@@ -365,6 +523,10 @@ class Scene:
         target_intrs = torch.cat([parallel_intrs.repeat(2, 1, 1), vertical_intrs], dim=0)
 
         # input_imgs = torch.cat([input_imgs[:-1,...], input_imgs[1:,...], input_imgs[:-1,...], input_imgs[:-1,...], input_imgs[1:,...], input_imgs[1:,...]], dim=0).cpu() # NOTE vright_cleft
+        # input_blur_maps = torch.cat([input_blur_maps[:-1,...], input_blur_maps[1:,...], input_blur_maps[:-1,...], input_blur_maps[:-1,...], \
+        #                              input_blur_maps[1:,...], input_blur_maps[1:,...]], dim=0).cpu()
+        # input_motion_masks = torch.cat([input_motion_masks[:-1,...], input_motion_masks[1:,...], input_motion_masks[:-1,...], input_motion_masks[:-1,...], \
+        #                                 input_motion_masks[1:,...], input_motion_masks[1:,...]], dim=0).cpu()
         # mvs_depths = torch.cat([mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[:-1,...], mvs_depths[:-1,...], mvs_depths[1:,...], mvs_depths[1:,...]], dim=0).cpu()
         # input_extrs = torch.cat([input_extrs[:-1,...], input_extrs[1:,...], input_extrs[:-1,...], input_extrs[:-1,...], input_extrs[1:,...], input_extrs[1:,...]], dim=0)
         # input_intrs = torch.cat([input_intrs[:-1,...], input_intrs[1:,...], input_intrs[:-1,...], input_intrs[:-1,...], input_intrs[1:,...], input_intrs[1:,...]], dim=0)
@@ -403,7 +565,7 @@ def parallel_trajectory_interpolation(extrinsics):
 
     return np.stack(pseudo_poses, axis=0)
 
-def vertical_trajectory_single_direction_interpolation(start_pos, end_pos, z_scale=0.5):
+def vertical_trajectory_single_direction_interpolation(start_pos, end_pos, z_scale=0.5, radiu=0.5):
     '''
     known: (a1, a2, a3), (b1, b2, b3), a1c1 + a2c2 + a3c3 = 0, b1c1 + b2c2 + b3c3 = 0, c3=1
     ask: (c1, c2, c3)
@@ -418,15 +580,15 @@ def vertical_trajectory_single_direction_interpolation(start_pos, end_pos, z_sca
     a = a / np.linalg.norm(a, axis=1)[...,np.newaxis] # v_num-1, 3
 
     pseudo_poses1 = start_pos.copy() # MARK: in-place
-    pseudo_poses1[:, :3, 3] = pseudo_poses1[:, :3, 3] + a * z_scale + c * 0.5 # v_num-1, 4, 4
+    pseudo_poses1[:, :3, 3] = pseudo_poses1[:, :3, 3] + a * z_scale + c * radiu # v_num-1, 4, 4
 
     pseudo_poses2 = start_pos.copy()
-    pseudo_poses2[:, :3, 3] = pseudo_poses2[:, :3, 3] + a * z_scale - c * 0.5 # v_num-1, 4, 4
+    pseudo_poses2[:, :3, 3] = pseudo_poses2[:, :3, 3] + a * z_scale - c * radiu # v_num-1, 4, 4
 
     pseudo_poses = np.concatenate([pseudo_poses1[:,:], pseudo_poses2[:,:]], 0) # 2 * (v_num-1), 4, 4
     return pseudo_poses
 
-def central_single_direction_interpolation(start_pos, end_pos, central_poses, z_scale=0.5):
+def central_single_direction_interpolation(start_pos, end_pos, central_poses, z_scale=0.5, radiu=0.5):
     
     '''
     known: (a1, a2, a3), (b1, b2, b3), a1c1 + a2c2 + a3c3 = 0, b1c1 + b2c2 + b3c3 = 0, c3=1
@@ -443,29 +605,29 @@ def central_single_direction_interpolation(start_pos, end_pos, central_poses, z_
 
     pseudo_poses1 = central_poses.copy() # MARK: in-place
     start_center1 = start_pos[:, :3, 3].copy()
-    pseudo_poses1[:, :3, 3] = start_center1 + b * 0.5 + a * z_scale + c * 0.5 # v_num-1, 4, 4
+    pseudo_poses1[:, :3, 3] = start_center1 + b * 0.5 + a * z_scale + c * radiu # v_num-1, 4, 4
 
     pseudo_poses2 = central_poses.copy() # MARK: in-place
     start_center2 = start_pos[:, :3, 3].copy()
-    pseudo_poses2[:, :3, 3] = start_center2 + b * 0.5 + a * z_scale - c * 0.5 # v_num-1, 4, 4
+    pseudo_poses2[:, :3, 3] = start_center2 + b * 0.5 + a * z_scale - c * radiu # v_num-1, 4, 4
 
     pseudo_poses = np.concatenate([pseudo_poses1[:,:], pseudo_poses2[:,:]], 0) # 2 * (v_num-1), 4, 4
     return pseudo_poses
 
-def vertical_trajectory_interpolation(extrinsics, right=0.5, left=0.5):
+def vertical_trajectory_interpolation(extrinsics, right=0.5, left=0.5, radiu=0.5):
 
     poses = np.stack([np.linalg.inv(extrinsics[i]) for i in range(extrinsics.shape[0])]) # c2w, v_num, 4, 4
 
     start_pos = poses[:-1,...]
     end_pos = poses[1:,...]
-    pseudo_poses_right = vertical_trajectory_single_direction_interpolation(start_pos, end_pos, right) # 2 * (v_num-1), 4, 4
-    pseudo_poses_left = vertical_trajectory_single_direction_interpolation(end_pos, start_pos, left) # 2 * (v_num-1), 4, 4
+    pseudo_poses_right = vertical_trajectory_single_direction_interpolation(start_pos, end_pos, right, radiu) # 2 * (v_num-1), 4, 4
+    pseudo_poses_left = vertical_trajectory_single_direction_interpolation(end_pos, start_pos, left, radiu) # 2 * (v_num-1), 4, 4
     pseudo_poses = np.concatenate([pseudo_poses_right[:,:], pseudo_poses_left[:,:]], 0) # 4 * (v_num-1), 4, 4
 
     # return pseudo_poses
     return pseudo_poses_right
 
-def central_interpolation(extrinsics, right=0.5, left=0.5):
+def central_interpolation(extrinsics, right=0.5, left=0.5, radiu=0.5):
 
     poses = np.stack([np.linalg.inv(extrinsics[i]) for i in range(extrinsics.shape[0])]) # c2w, v_num, 4, 4
 
@@ -480,8 +642,8 @@ def central_interpolation(extrinsics, right=0.5, left=0.5):
         pseudo_poses.append(pseudo_pose)
 
     central_poses =  np.stack(pseudo_poses, axis=0) # v_num-1, 4, 4
-    pseudo_poses_right = central_single_direction_interpolation(start_pos, end_pos, central_poses, right) # 2 * (v_num-1), 4, 4
-    pseudo_poses_left = central_single_direction_interpolation(end_pos, start_pos, central_poses, left) # 2 * (v_num-1), 4, 4
+    pseudo_poses_right = central_single_direction_interpolation(start_pos, end_pos, central_poses, right, radiu) # 2 * (v_num-1), 4, 4
+    pseudo_poses_left = central_single_direction_interpolation(end_pos, start_pos, central_poses, left, radiu) # 2 * (v_num-1), 4, 4
     central_pseudo_poses = np.concatenate([pseudo_poses_right[:,:], pseudo_poses_left[:,:]], 0) # 4 * (v_num-1), 4, 4
 
     return central_pseudo_poses

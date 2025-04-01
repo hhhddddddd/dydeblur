@@ -1,63 +1,130 @@
 #!/bin/bash
 
-'''train
-'''
+d2rf="Camp Car Dining1 Dining2 Dock Gate Mountain Shop"
+# dyblurf="man seesaw skating street third women"
+dyblurf="man"
+skating="skating"
+declare -A sc
+sc["Camp"]="0.1"
+sc["Car"]="0.01"
+sc["Dining1"]="0.1"
+sc["Dining2"]="0.01"
+sc["Dock"]="0.01"
+sc["Gate"]="0.01"
+sc["Mountain"]="0.01"
+sc["Shop"]="0.1"
 
-export CUDA_VISIBLE_DEVICES=3
-# python train.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp -o new -e mask_extent_skip_connect_align_sigmod_center5. -c -1 --eval --iterations 40000 # 
-# python train.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car -o new -e mask_align_depth -c 0.01 --eval --iterations 40000
-# python train.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 -o new -e mask_extent_skip_connect_align_sigmod_center5. -c 1.0 --eval --iterations 40000 # 
-# python train.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 -o new -e mask0.0005_extent_skip_connect_align_sigmod_center5. -c 0.1 --eval --iterations 40000
-# python train.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock -o new -e mask_align_depth --eval -c 0.9 --iterations 40000
-# python train.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate -o new -e mask_align_depth --eval -c -1 --iterations 40000 # 
-# python train.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain -o new -e mask0.00001_alig0.00001_skip_connect -c -1 --eval --iterations 40000
-# python train.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop -o new -e mask_extent_skip_connect_align0.0001_sigmod_center5._depth -c 1.0 --eval --iterations 40000
+sc["man"]="0.01"
+sc["seesaw"]="0.04"
+sc["skating"]="0.01"
+sc["street"]="0.01"
+sc["third"]="0.02"
+sc["women"]="0.01"
+
+declare -A time
+time["Camp"]="2025-02-17_00:23"
+time["Car"]="2025-02-17_00:23"
+time["Dining1"]="2025-02-17_00:23"
+time["Dining2"]="2025-02-17_00:23"
+time["Dock"]="2025-02-17_00:23"
+time["Gate"]="2025-02-17_00:23"
+time["Mountain"]="2025-02-17_00:23"
+time["Shop"]="2025-02-17_00:23"
+
+time["man"]="2025-02-17_00:23"
+time["seesaw"]="2025-02-17_00:23"
+time["skating"]="2025-02-17_00:23"
+time["street"]="2025-02-17_00:23"
+time["third"]="2025-02-17_00:23"
+time["women"]="2025-02-17_00:23"
+
+###------------------------------ train low ------------------------------###
+# export CUDA_VISIBLE_DEVICES=7
+# for scene in $dyblurf; do
+#     python train.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene \
+#                     -o new -c ${sc["$scene"]} -e l_sc${sc["$scene"]}_masksmoothdown --eval --iterations 40000
+# done
+
+# export CUDA_VISIBLE_DEVICES=6
+# for scene in $d2rf; do
+#     python train.py -s /home/xuankai/dataset/new_d2rf_test/$scene/x2 -m output/dydeblur/Dydeblur/d2rf/$scene \
+#                     -o new -c ${sc["$scene"]} -e l_sc${sc["$scene"]}_masksmoothdown --eval --iterations 40000
+# done
+
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $skating; do
+#     python train.py -s /home/xuankai/dataset/new_dyblurf/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene \
+#                     -o new -c ${sc["$scene"]} -e l_sc${sc["$scene"]}_masksmoothdown_dyblurf --eval --iterations 40000
+# done
 
 
-python train.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball -o new -c 0.05 -e mask_align_extent --eval --iterations 40000
-# python train.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children -o new -c 0.006 -e mask_align_extent --eval --iterations 40000
-# python train.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor -o new -c 0.003 -e mask_align_extent --eval --iterations 40000
-# python train.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw -o new -c 0.04 -e mask_align_extent7.5  --eval --iterations 40000
-# python train.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating -o new -c 0.03 -e mask_align_extent5. --eval --iterations 40000
-# python train.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street -o new -c 0.03 -e mask_align_extent --eval --iterations 40000
+###------------------------------ train high ------------------------------###
+# export CUDA_VISIBLE_DEVICES=0
+# for scene in $dyblurf; do
+#     python train.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x1 -m output/dydeblur/Dydeblur/dyblurfh/$scene \
+#                     -o new -c ${sc["$scene"]} -e h_sc${sc["$scene"]}_masksmoothdown --eval --iterations 40000
+# done
 
+# export CUDA_VISIBLE_DEVICES=6
+# for scene in $d2rf; do
+#     python train.py -s /home/xuankai/dataset/new_d2rf_test/$scene/x1 -m output/dydeblur/Dydeblur/d2rfh/$scene \
+#                     -o new -c ${sc["$scene"]} -e h_sc${sc["$scene"]}_masksmoothdown --eval --iterations 40000
+# done
 
-'''render
-'''
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $skating; do
+#     python train.py -s /home/xuankai/dataset/new_dyblurf/$scene/x1 -m output/dydeblur/Dydeblur/dyblurfh/$scene \
+#                     -o new -c ${sc["$scene"]} -e h_sc${sc["$scene"]}_masksmoothdown_dyblurf --eval --iterations 40000
+# done
 
-# python render.py -m output/dydeblur/D2RF/Camp -o new -t 2024-11-26_16:27 -c -1 --mode render # 0.1
-# python render.py -m output/dydeblur/D2RF/Car -o new -t 2024-12-08_15:00 -c 0.01 --mode render # 0.1
-# python render.py -m output/dydeblur/D2RF/Dining1 -o new -t 2024-11-26_12:48 -c 1.0 --mode render # 0.9
-# python render.py -m output/dydeblur/D2RF/Dining2 -o new -t 2024-11-26_11:39 -c 0.1 --mode render # true 0.1
-# python render.py -m output/dydeblur/D2RF/Dock -o new -t 2024-12-05_12:52 -c 0.9 --mode render # 1.0
-# python render.py -m output/dydeblur/D2RF/Gate -o new -t 2024-11-26_16:29 -c -1 --mode render # 0.1
-# python render.py -m output/dydeblur/D2RF/Mountain -o new -t 2024-11-22_22:35 -c -1 --mode render # 0.1
-# python render.py -m output/dydeblur/D2RF/Shop -o new -t 2024-11-26_13:37 -c 1.0 --mode render # 1.0
+###------------------------------ render low ------------------------------###
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $dyblurf; do
+#     python render.py -m output/dydeblur/Dydeblur/dyblurf/$scene \
+#                      -o new -c ${sc["$scene"]} -t ${time["$scene"]} --mode render 
+# done
 
+# for scene in $d2rf; do
+#     python render.py -m output/dydeblur/Dydeblur/d2rf/$scene \
+#                      -o new -c ${sc["$scene"]} -t ${time["$scene"]} --mode render 
+# done
 
-# python render.py -m output/dydeblur/DyBluRF/basketball -o new -t 2024-09-29_11:22 --mode render 
-# python render.py -m output/dydeblur/DyBluRF/children -o new -t 2024-09-29_11:22 --mode render 
-# python render.py -m output/dydeblur/DyBluRF/sailor -o new -t 2024-09-28_23:10 --mode render 
-# python render.py -m output/dydeblur/DyBluRF/seesaw -o new -t 2024-12-16_10:15 -c -1 --mode render 
-# python render.py -m output/dydeblur/DyBluRF/skating -o new -t 2024-09-27_20:44 --mode render 
-# python render.py -m output/dydeblur/DyBluRF/street -o new -t 2024-09-27_20:44 --mode render 
+###------------------------------ render high ------------------------------###
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $dyblurf; do
+#     python render.py -m output/dydeblur/Dydeblur/dyblurfh/$scene \
+#                      -o new -c ${sc["$scene"]} -t ${time["$scene"]} --mode render 
+# done
 
-'''test
-'''
+# for scene in $d2rf; do
+#     python render.py -m output/dydeblur/Dydeblur/d2rfh/$scene \
+#                      -o new -c ${sc["$scene"]} -t ${time["$scene"]} --mode render 
+# done
 
-# python metrics.py -s data/D2RF/Camp -m output/dydeblur/D2RF/Camp --use_alex
-# python metrics.py -s data/D2RF/Car -m output/dydeblur/D2RF/Car --use_alex
-# python metrics.py -s data/D2RF/Dining1 -m output/dydeblur/D2RF/Dining1 --use_alex
-# python metrics.py -s data/D2RF/Dining2 -m output/dydeblur/D2RF/Dining2 --use_alex
-# python metrics.py -s data/D2RF/Dock -m output/dydeblur/D2RF/Dock --use_alex
-# python metrics.py -s data/D2RF/Gate -m output/dydeblur/D2RF/Gate --use_alex
-# python metrics.py -s data/D2RF/Mountain -m output/dydeblur/D2RF/Mountain --use_alex
-# python metrics.py -s data/D2RF/Shop -m output/dydeblur/D2RF/Shop --use_alex
+###------------------------------ metrics low ------------------------------###
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $dyblurf; do
+#     python metrics.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene --use_alex
+# done
 
+# for scene in $d2rf; do
+#     python metrics.py -s /home/xuankai/dataset/new_d2rf_test/$scene/x2 -m output/dydeblur/Dydeblur/d2rf/$scene --use_alex
+# done
 
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/basketball/dense -m output/dydeblur/DyBluRF/basketball 
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/children/dense -m output/dydeblur/DyBluRF/children
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/sailor/dense -m output/dydeblur/DyBluRF/sailor 
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/seesaw/dense -m output/dydeblur/DyBluRF/seesaw
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/skating/dense -m output/dydeblur/DyBluRF/skating
-# python metrics.py -s data/DyBluRF/stereo_blur_dataset/street/dense -m output/dydeblur/DyBluRF/street 
+# for scene in $skating; do
+#     python metrics.py -s -s /home/xuankai/dataset/new_dyblurf/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene --use_alex
+# done
+
+###------------------------------ metrics high ------------------------------###
+# export CUDA_VISIBLE_DEVICES=5
+# for scene in $dyblurf; do
+#     python metrics.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x1 -m output/dydeblur/Dydeblur/dyblurfh/$scene --use_alex
+# done
+
+# for scene in $d2rf; do
+#     python metrics.py -s /home/xuankai/dataset/new_d2rf_test/$scene/x1 -m output/dydeblur/Dydeblur/d2rfh/$scene --use_alex
+# done
+
+# for scene in $skating; do
+#     python metrics.py -s -s /home/xuankai/dataset/new_dyblurf/$scene/x1 -m output/dydeblur/Dydeblur/dyblurfh/$scene --use_alex
+# done

@@ -65,9 +65,10 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
-        self.not_use_gt_rgbd = True
-        self._gaussian_spatial_lr_scale = 5.0
-        self._jdeform_spatial_lr_scale = 5.0
+        self.not_use_dynamic_mask = False
+        self.canot = 12 # useless
+        self.gaussian_spatial_lr_scale = 5.0
+        self.deform_spatial_lr_scale = 5.0
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -101,16 +102,16 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
-        self.dynamic_lr = 0.001
+        self.motion_coefs_lr = 0.01
         self.percent_dense = 0.01 # what's this?
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
         self.densify_until_iter = 15_000 # 15_000
-        self._densify_grad_threshold = 0.0002 # 0.0002
-        self._for_min_opacity = 0.005 # 0.005
-        self._prune_cameras_extent = 7.5
+        self.densify_grad_threshold = 0.0002 # 0.0002
+        self.min_opacity = 0.005 # 0.005
+        self.prune_cameras_extent = 7.5 # 7.5
 
         self.gtnet_lr = 1e-3
         self.max_clamp = 1.1
@@ -120,17 +121,55 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         self.virtual_lambda_dssim = 0.2
 
         self.use_mask_loss = True    # mask
-        self._zmask_loss_alpha = 0.001    # 0.001
+        self._blurmask_loss_alpha = 0.001    # 0.001
         self.use_mask_sparse_loss = False    # mask
         self.mask_sparse_loss_alpha = 0.001    # 0.001
         self.use_align_loss = True    # align
         self._align_loss_alpha = 0.001   # 0.001
-        self.align_loss_iteration = 5500   # 0.001
+        self.align_loss_iteration = 5500
         self.use_rgbtv_loss = False    # rgbtv
         self.rgbtv_loss_alpha = 0.1     # 0.001  
         self.use_depth_loss = False     # depth
         self.depth_loss_alpha = 0.1   # 0.001 
         
+
+        # all loss.
+        self.depth_loss = 0.0 # 0.075
+        self.depth_grad_loss = 0.0 # 1.0; static region        
+        self.depth_virtual_loss = 0.0 # 0.5
+        self.depth_grad_virtual_loss = 0.0 # 1.0; static region
+        self.scale_var_loss = 0.00 # 0.01
+        
+        self.mask_loss = 0.075 # 1.0
+        self.motion_smooth_loss = 0.075 # 0.1
+        self.track_smooth_loss = 0.2 # 2.0
+        self.z_acc_loss = 1.0
+        self.downsample_loss = 0.1 # 0.1
+
+        # no loss.
+        # self.depth_loss = 0.0 # 0.075
+        # self.depth_grad_loss = 0.0 # 1.0; static region
+        # self.depth_virtual_loss = 0.0 # 0.5
+        # self.depth_grad_virtual_loss = 0.0 # 1.0; static region
+        # self.mask_loss = 0.0 # 0.075
+        # self.scale_var_loss = 0.0 # 0.01
+        # self.motion_smooth_loss = 0.0 # 0.1
+        # self.track_smooth_loss = 0.0 # 2.0
+        # self.z_acc_loss = 0.0
+        # self.downsample_loss = 0.0 # 0.1
+
+        # origin all loss.
+        # self.depth_loss = 0.075 # 0.5
+        # self.depth_grad_loss = 0.0 # 1.0; static region        
+        # self.depth_virtual_loss = 0.0 # 0.5; no virtual depth
+        # self.depth_grad_virtual_loss = 0.0 # 1.0; no virtual depth
+        # self.mask_loss = 1.0 # 1.0
+        # self.scale_var_loss = 0.01 # 0.01
+        # self.motion_smooth_loss = 0.1 # 0.1
+        # self.track_smooth_loss = 2.0 # 2.0
+        # self.z_acc_loss = 1.0
+        # self.downsample_loss = 0.1 # 0.1
+
         super().__init__(parser, "Optimization Parameters")
 
 

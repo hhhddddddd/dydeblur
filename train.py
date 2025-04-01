@@ -10,8 +10,8 @@
 #
 
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = '6' # MARK: GPU
-os.environ["OMP_NUM_THREADS"] = '4' # MARK: THREAD
+# os.environ["CUDA_VISIBLE_DEVICES"] = '6' # NOTE GPU
+os.environ["OMP_NUM_THREADS"] = '4' # NOTE THREAD
 # os.environ["export CUDA_LAUNCH_BLOCKING"] = '1'
 import sys
 import time
@@ -19,12 +19,15 @@ import json
 import pdbr
 import lpips
 import models
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from random import randint
-from utils.loss_utils import l1_loss, ssim, tv_loss, align_loss, align_loss_center
-from gaussian_renderer import render, network_gui
+from utils.loss_utils import l1_loss, ssim, tv_loss, align_loss, \
+    masked_l1_loss, compute_gradient_loss, compute_se3_smoothness_loss, compute_z_acc_loss
+from gaussian_renderer import render, render_depth, render_som, render_depth_som
 from scene import Scene, GaussianModel, DeformModel, MLP, Blur
 from utils.general_utils import safe_state, get_linear_noise_func, get_2d_emb
 import uuid
@@ -32,6 +35,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from skimage.metrics import structural_similarity
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     # if exc_type is not KeyboardInterrupt:
@@ -43,8 +47,8 @@ sys.excepthook = handle_exception
 try:
     from torch.utils.tensorboard import SummaryWriter
 
-    TENSORBOARD_FOUND = True # MARK: switch tb_writer
-    # TENSORBOARD_FOUND = False
+    # TENSORBOARD_FOUND = True # NOTE switch tb_writer
+    TENSORBOARD_FOUND = False
 except ImportError:
     TENSORBOARD_FOUND = False
 
@@ -54,15 +58,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     tb_writer = prepare_output_and_logger(dataset, starttime) # TensorBoard
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
-    deform = DeformModel(dataset.is_blender, dataset.is_6dof, dataset.jdeform_spatial_lr_scale) # DeformModel contains DeformNetwork, scene.cameras_extent
-    deform.train_setting(opt) # Initialize the optimizer and the learning rate scheduler
-    # dynamic_mlp = MLP(input_ch=3, output_ch=1)
-    # dynamic_mlp.train_setting(opt)
+    motion_model = None
+    deform = None
+    som = True
+    # som = False
+    if som:
+        motion_model = scene.motion_model
+        motion_model.train_setting(opt)
+    else:
+        deform = DeformModel(dataset.is_blender, dataset.is_6dof, dataset.deform_spatial_lr_scale) # DeformModel contains DeformNetwork, scene.cameras_extent
+        deform.train_setting(opt) # Initialize the optimizer and the learning rate scheduler
+    max_pool = nn.MaxPool2d(kernel_size=9, stride=1, padding=4)
 
-    camera_train_num = len(scene.getTrainCameras())
+    camera_train_num = len(scene.getTrainCameras()) # 24
     image_h, image_w = scene.getTrainCameras()[0].original_image.shape[1:]
     print("Number Train Camera = {}, image size: {} x {}".format(camera_train_num, image_h, image_w))
-    blur = Blur(camera_train_num, image_h, image_w, ks=dataset.kernel, not_use_rgbd=False, not_use_pe=False, not_use_gt_rgbd=dataset.not_use_gt_rgbd, skip_connect=True).to("cuda") # single scale
+    blur = Blur(camera_train_num, image_h, image_w, ks=dataset.kernel, not_use_rgbd=False, not_use_pe=False, not_use_dynamic_mask=dataset.not_use_dynamic_mask, skip_connect=True).to("cuda") # single scale
     blur.train_setting()
     unfold_ss = torch.nn.Unfold(kernel_size=(dataset.kernel, dataset.kernel), padding=dataset.kernel // 2).cuda()
 
@@ -70,13 +81,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     gaussians.training_setup(opt) # Initialize the optimizer and the learning rate scheduler
     lpips_fn = lpips.LPIPS(net='vgg').cuda()
     with torch.no_grad():
-        model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1)
-    if dataset.source_path.split('/')[-1] == 'dense':
+        model = models.PerceptualLoss(model='net-lin',net='alex', use_gpu=True, version=0.1) # D2RF, Deblur4DGS
+    if dataset.source_path.split('/')[-1] == 'dense': # DybluRF
         use_alex = False
-    else:
+        use_skimage_ssim = True
+    elif dataset.source_path.split('/')[-1] == 'x1': # Deblur4DGS
         use_alex = True
+        use_skimage_ssim = True
+    else: # Deblur4DGS
+        use_alex = True
+        use_skimage_ssim = False
     print("use_alex:", use_alex)
 
+    # bg_color = [1, 1, 1] # Deblur4DGS
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -98,7 +115,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000) # Novelty: learning rate decay function
     loss_texts = []
     gs_texts = []
-    print(opt.zmask_loss_alpha, opt.align_loss_alpha, opt.densify_grad_threshold, opt.for_min_opacity, opt.prune_cameras_extent)
+    print(opt.blurmask_loss_alpha, opt.align_loss_alpha, opt.densify_grad_threshold, opt.min_opacity, opt.prune_cameras_extent)
     for iteration in range(1, opt.iterations + 1):
 
         iter_start.record() # record start time
@@ -128,23 +145,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         fid = viewpoint_cam.fid # input time
         
         # opt.warm_up = 1000
-        if iteration < opt.warm_up:         # warm_up == 3000; maybe for static region
+        if som:
+            render_pkg_re = render_som(viewpoint_cam, gaussians, pipe, background, motion_model, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+
+        elif iteration < opt.warm_up:         # warm_up == 3000; maybe for static region
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+
         else:
             N = gaussians.get_xyz.shape[0]  # current gaussian quantity, eg: 10587
             time_input = fid.unsqueeze(0).expand(N, -1) # Expand the input in the time dimension, eg:torch.Size([10587,1])
             ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration) # for time_input; why do this?
-            d_xyz, d_rotation, d_scaling, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # MARK: .detach()
+            d_xyz, d_rotation, d_scaling, _ = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise) # NOTE .detach()
 
-            
             if tb_writer and iteration % 100 == 0:
                 tb_writer.add_histogram("scene/d_xyz", d_xyz.abs(), iteration)
                 tb_writer.add_histogram("scene/d_rotation", d_rotation.abs(), iteration)
                 tb_writer.add_histogram("scene/d_scaling", d_scaling.abs(), iteration)
             
-        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
-        image, viewspace_point_tensor, visibility_filter, radii, depth = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
-            render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"]
+            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+        
+        image, viewspace_point_tensor, visibility_filter, radii, depth, dynamic_mask = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
+            render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"], render_pkg_re["dynamic_mask"]
 
         maskloss = 0.
         maskloss_sparse = 0.
@@ -152,29 +174,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         tvloss = 0.
         alignloss = 0.
         if iteration > opt.blur_iteration: # in order to stable train
-
+            
+            sharp_image = image
             shuffle_rgb = image.unsqueeze(0) # 1, 3, 400, 940
             shuffle_depth = depth.unsqueeze(0) - depth.min() # 1, 1, 400, 940
             shuffle_depth = shuffle_depth/shuffle_depth.max()
             pos_enc = get_2d_emb(1, shuffle_rgb.shape[-2], shuffle_rgb.shape[-1], 16, torch.device(0)) # 1, 400, 940, 16
 
-            if dataset.not_use_gt_rgbd:
+            if dataset.not_use_dynamic_mask:
                 kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb,shuffle_depth],1).detach()) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
             else:
-                gt_image = viewpoint_cam.original_image.cuda().unsqueeze(0) # 1, 3, 400, 940
-                gt_depth = viewpoint_cam.depth.cuda().unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
-                gt_depth = gt_depth - gt_depth.min()
-                gt_depth = 1 - (gt_depth / gt_depth.max())
-                kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),gt_image,gt_depth],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
+                dmask = dynamic_mask.unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
+                kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
             patches = unfold_ss(shuffle_rgb) # 1, 9 * 9 * 3, 400 * 940
             patches = patches.view(1, 3, dataset.kernel ** 2, shuffle_rgb.shape[-2], shuffle_rgb.shape[-1]) # 1, 3, 81, 400, 940
             kernel_weights = kernel_weights.unsqueeze(1) # 1, 1, 81, 400, 940
             rgb = torch.sum(patches * kernel_weights, 2)[0] # 3, 400, 940
-            mask = mask[0] # 1, 400, 940
+            mask = mask[0] # 1, 400, 940; more large more blur
+            # mask = torch.max(mask, dynamic_mask.unsqueeze(0)*1.0) # motion_mask update mask
             image = mask*rgb + (1-mask)*image
             # image = rgb
 
-            maskloss = opt.zmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0
+            maskloss = opt.blurmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0
             maskloss_sparse = opt.mask_sparse_loss_alpha * torch.cat((mask,1.-mask),dim=0).min(0)[0].mean() if opt.use_mask_sparse_loss else 0
             # center = align_loss_center(iteration, init=1.0, final=0.5) # float
             # center = torch.clamp((1 - mask), 0.5, 1.0) # 1, 400, 940
@@ -193,15 +214,157 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         gt_depth = viewpoint_cam.depth.cuda()
-        if not viewpoint_cam.is_virtual:
+        if not viewpoint_cam.is_virtual: # train
             # blur_map = viewpoint_cam.blur_map.cuda()
             Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + maskloss + depthloss + tvloss + alignloss + maskloss_sparse
-        else:
+            
+            
+            # Depth loss. (1)
+            pred_disp = 1.0 / (depth[..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_render
+            gt_disp = 1.0 / (gt_depth[None, ..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_gt
+            depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98)
+            loss += depth_loss * opt.depth_loss # 0.5
+
+            # Depth loss. (2)
+            mask_dilated = max_pool(viewpoint_cam.motion_mask.float().cuda()[None, ..., None]) # refine dynamic mask / expend dynamic region 
+            depth_masks = (1. - mask_dilated.float()).bool() # static region
+            depth_gradient_loss = compute_gradient_loss(pred_disp, gt_disp, depth_masks, quantile=0.95)
+            loss += depth_gradient_loss * opt.depth_grad_loss # 1.0
+            if iteration % 101 == 0: print('train_depth', (depth_loss*opt.depth_loss).item(), (depth_gradient_loss*opt.depth_grad_loss).item())
+            
+            # Mask loss.
+            pred_mask = dynamic_mask[None, ..., None] # 1, H, W, 1
+            gt_mask = viewpoint_cam.motion_mask[None, ..., None] # 1, H, W, 1
+            mask_loss = masked_l1_loss(pred_mask, gt_mask, quantile=0.98)
+            loss += mask_loss * opt.mask_loss
+            if iteration % 101 == 0: print('train_mask', (mask_loss * opt.mask_loss).item())
+
+            if som:
+                # Motion base smooth loss. 
+                small_accel_loss = compute_se3_smoothness_loss(motion_model.params["rots"], motion_model.params["transls"])
+                loss += small_accel_loss * opt.motion_smooth_loss
+
+                # Track smooth loss.     
+                fg = gaussians.get_dynamics.detach().bool().squeeze() # 107392, 1;
+                indices = torch.nonzero(fg).squeeze() # fg index
+                means = gaussians.get_xyz   # 107392, 3
+                coefs = gaussians.get_motion_coefs # 107392, 20
+                fg_means = means[indices]   # 7392, 3
+                fg_coefs = coefs[indices]   # 7392, 20
+
+                ts = torch.clamp(torch.tensor([viewpoint_cam.uid]).cuda(), min=1, max=camera_train_num-2) # tracks should be smooth
+                ts_neighbors = torch.cat((ts - 1, ts, ts + 1))
+                transfms_nbs = motion_model.compute_transforms(ts_neighbors, fg_coefs)  # (G, 3n, 3, 4)
+                means_fg_nbs = torch.einsum("pnij,pj->pni", transfms_nbs, F.pad(fg_means, (0, 1), value=1.0))
+                means_fg_nbs = means_fg_nbs.reshape(means_fg_nbs.shape[0], 3, -1, 3) # [G, 3, n, 3]
+                small_accel_loss_tracks = 0.5 * ((2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:]).norm(dim=-1).mean())
+                loss += small_accel_loss_tracks * opt.track_smooth_loss
+
+                # z_acc loss.
+                R = np.transpose(viewpoint_cam.R) # R in w2c
+                T = viewpoint_cam.T # T in w2c
+                w2c = np.hstack((R, T[..., None]))
+                w2c = torch.tensor(np.vstack((w2c, np.array([0., 0., 0., 1.])))).unsqueeze(0).cuda()
+                z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2c) # Acceleration along ray direction should be small.
+                loss += z_accel_loss * opt.z_acc_loss
+                if iteration % 101 == 0: print('train_smooth', (small_accel_loss*opt.motion_smooth_loss).item(), \
+                        (small_accel_loss_tracks*opt.track_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
+
+            # Scale loss.
+            # scale_loss = torch.var(gaussians.get_scaling, dim=-1).mean() 
+            scale_loss = torch.var(gaussians._scaling, dim=-1).mean()
+            loss += scale_loss * opt.scale_var_loss
+            if iteration % 101 == 0: print('train_scale', (scale_loss*opt.scale_var_loss).item())
+
+            # Downsample loss.
+            if iteration > (opt.blur_iteration+1000): # don't use motion mask
+                sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
+                # sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]) # 1, 1, H, W
+                render_down = sharp_image.unsqueeze(0) # 1, 3, H, W; sharp image_render
+                render_down = F.interpolate(render_down, scale_factor=0.25, mode='area') # 1, 3, H, W -> 1, 3, H/4, W/4
+                render_down = render_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1) # 1, H/4, W/4, 3
+                blury_down = F.interpolate(gt_image.unsqueeze(0), scale_factor=0.25, mode='area') # blur image_gt
+                blury_down = blury_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1)
+                loss_keep = F.l1_loss(render_down, blury_down)
+                loss += loss_keep * opt.downsample_loss # 0.1
+                if iteration % 101 == 0: print('train_down', (loss_keep*opt.downsample_loss).item())
+
+        else: # virtual
             # blur_map = viewpoint_cam.blur_map.cuda()
             unseen_v_Ll1 = l1_loss(image, gt_image)
             loss = (1.0 - opt.virtual_lambda_dssim) * unseen_v_Ll1 + opt.virtual_lambda_dssim * (1.0 - ssim(image, gt_image)) + maskloss + depthloss + tvloss + alignloss + maskloss_sparse
+            
+            # Depth loss. (1)
+            pred_disp = 1.0 / (depth[..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_render
+            gt_disp = 1.0 / (gt_depth[None, ..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_gt
+            depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98)
+            loss += depth_loss * opt.depth_virtual_loss # 0.5
+            
+            # Depth loss. (2)
+            mask_dilated = max_pool(viewpoint_cam.motion_mask.float().cuda()[None, ..., None]) # refine dynamic mask / expend dynamic region 
+            depth_masks = (1. - mask_dilated.float()).bool() # static region
+            depth_gradient_loss = compute_gradient_loss(pred_disp, gt_disp, depth_masks, quantile=0.95)
+            loss += depth_gradient_loss * opt.depth_grad_virtual_loss # 1.0
+            if iteration % 101 == 0: print('virtual_depth', (depth_loss*opt.depth_loss).item(), (depth_gradient_loss*opt.depth_grad_loss).item())
 
+            # Mask loss.
+            pred_mask = dynamic_mask[None, ..., None] # 1, H, W, 1
+            gt_mask = viewpoint_cam.motion_mask.float()[None, ..., None] # 1, H, W, 1
+            mask_loss = masked_l1_loss(pred_mask, gt_mask, quantile=0.98)
+            loss += mask_loss * opt.mask_loss
+            if iteration % 101 == 0: print('virtual_mask', (mask_loss * opt.mask_loss).item())
+
+            if som:
+                # Motion base smooth loss. 
+                small_accel_loss = compute_se3_smoothness_loss(motion_model.params["rots"], motion_model.params["transls"])
+                loss += small_accel_loss * opt.motion_smooth_loss
+
+                # Track smooth loss.     
+                fg = gaussians.get_dynamics.detach().bool().squeeze() # 107392, 1;
+                indices = torch.nonzero(fg).squeeze() # fg index
+                means = gaussians.get_xyz   # 107392, 3
+                coefs = gaussians.get_motion_coefs # 107392, 20
+                fg_means = means[indices]   # 7392, 3
+                fg_coefs = coefs[indices]   # 7392, 20
+
+                ts = torch.clamp(torch.tensor([viewpoint_cam.uid]).cuda(), min=1, max=camera_train_num-2) # tracks should be smooth
+                ts_neighbors = torch.cat((ts - 1, ts, ts + 1))
+                transfms_nbs = motion_model.compute_transforms(ts_neighbors, fg_coefs)  # (G, 3n, 3, 4)
+                means_fg_nbs = torch.einsum("pnij,pj->pni", transfms_nbs, F.pad(fg_means, (0, 1), value=1.0))
+                means_fg_nbs = means_fg_nbs.reshape(means_fg_nbs.shape[0], 3, -1, 3) # [G, 3, n, 3]
+                small_accel_loss_tracks = 0.5 * ((2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:]).norm(dim=-1).mean())
+                loss += small_accel_loss_tracks * opt.track_smooth_loss
+
+                # z_acc loss.
+                R = np.transpose(viewpoint_cam.R) # R in w2c
+                T = viewpoint_cam.T # T in w2c
+                w2c = np.hstack((R, T[..., None]))
+                w2c = torch.tensor(np.vstack((w2c, np.array([0., 0., 0., 1.])))).unsqueeze(0).cuda()
+                z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2c) # Acceleration along ray direction should be small.
+                loss += z_accel_loss * opt.z_acc_loss
+                if iteration % 101 == 0: print('virtual_smooth', (small_accel_loss*opt.motion_smooth_loss).item(), \
+                        (small_accel_loss_tracks*opt.track_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
+            
+            # Scale loss.
+            # scale_loss = torch.var(gaussians.get_scaling, dim=-1).mean() 
+            scale_loss = torch.var(gaussians._scaling, dim=-1).mean()
+            loss += scale_loss * opt.scale_var_loss
+            if iteration % 101 == 0: print('virtual_scale', (scale_loss*opt.scale_var_loss).item())
+
+            # Downsample loss.
+            if iteration > (opt.blur_iteration+1000): # don't use motion mask
+                sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
+                # sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]) # 1, 1, H, W
+                render_down = sharp_image.unsqueeze(0) # 1, 3, H, W; sharp image_render
+                render_down = F.interpolate(render_down, scale_factor=0.25, mode='area') # 1, 3, H, W -> 1, 3, H/4, W/4
+                render_down = render_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1) # 1, H/4, W/4, 3
+                blury_down = F.interpolate(gt_image.unsqueeze(0), scale_factor=0.25, mode='area') # blur image_gt
+                blury_down = blury_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1)
+                loss_keep = F.l1_loss(render_down, blury_down)
+                loss += loss_keep * opt.downsample_loss # 0.1
+                if iteration % 101 == 0: print('virtual_down', (loss_keep * opt.downsample_loss).item())
+                
         loss.backward() # retain_graph=True
         iter_end.record() # record end time
 
@@ -210,12 +373,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
 
         with torch.no_grad():
             # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log # MARK: ema_loss
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
                 postfix_info = {
                     "L": f"{ema_loss_for_log:.{4}f}",
                     "G": f"{gaussians.get_xyz.shape[0]}",
-                    "S": f"{dataset.source_path.split('/')[-2] if dataset.source_path.split('/')[-1] == 'dense' else dataset.source_path.split('/')[-1]}",
+                    "S": f"{dataset.source_path.split('/')[-2] if dataset.source_path.split('/')[-1] in ['dense','x1','x2','x2.5'] else dataset.source_path.split('/')[-1]}",
                     "E": f"{dataset.experiment}"
                 }
                 progress_bar.set_postfix(postfix_info)
@@ -229,43 +392,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
 
             # Log and save
             cur_psnr_test, cur_psnr_train, cur_psnr_virtual, cur_ssim_test, cur_lpips_test = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end),
-                                       testing_iterations, scene, render, blur, (pipe, background), deform,
-                                       dataset.load2gpu_on_the_fly, dataset.is_6dof, dataset, opt, lpips_fn, model, use_model=use_alex)
+                                       testing_iterations, scene, render, render_som, blur, (pipe, background), deform, motion_model,
+                                       dataset.load2gpu_on_the_fly, dataset.is_6dof, dataset, opt, lpips_fn, model, use_model=use_alex, use_skimage_ssim=use_skimage_ssim, som=som)
             if iteration in testing_iterations: # best_psnr_test only aims to testing_iterations
                 if cur_psnr_test.item() > best_psnr_test:
                     best_psnr_test = cur_psnr_test.item()
                     best_ssim_test = cur_ssim_test.item()
                     best_lpips_test = cur_lpips_test.item()
                     best_iteration_test = iteration
-                    scene.save(iteration, starttime, dataset.operate, True)                                   # save 3d scene (point cloud)
-                    deform.save_weights(args.model_path, iteration, starttime, dataset.operate, True)         # save deformable filed
-                    blur.save_weights(args.model_path, iteration, starttime, dataset.operate, True)           # save blurkerel
-                if cur_psnr_train.item() > best_psnr_train:
-                    best_psnr_train = cur_psnr_train.item()
-                    best_iteration_train = iteration
-                if cur_psnr_virtual.item() > best_psnr_virtual:
-                    best_psnr_virtual = cur_psnr_virtual.item()
-                    best_iteration_virtual = iteration
+                    scene.save(iteration, starttime, dataset.operate, True)                                     # save 3d scene (point cloud)
+                    if som:
+                        motion_model.save_weights(args.model_path, iteration, starttime, dataset.operate, True) # save deformable filed
+                    else:
+                        deform.save_weights(args.model_path, iteration, starttime, dataset.operate, True)       # save deformable filed
+                    blur.save_weights(args.model_path, iteration, starttime, dataset.operate, True)             # save blurkerel
+                # if cur_psnr_train.item() > best_psnr_train: # NOTE
+                #     best_psnr_train = cur_psnr_train.item()
+                #     best_iteration_train = iteration
+                # if cur_psnr_virtual.item() > best_psnr_virtual: # NOTE
+                #     best_psnr_virtual = cur_psnr_virtual.item()
+                #     best_iteration_virtual = iteration
 
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, starttime, dataset.operate)                                   # save 3d scene (point cloud)
-                deform.save_weights(args.model_path, iteration, starttime, dataset.operate)         # save deformable filed
+                if som:
+                    motion_model.save_weights(args.model_path, iteration, starttime, dataset.operate) # save deformable filed
+                else:
+                    deform.save_weights(args.model_path, iteration, starttime, dataset.operate)         # save deformable filed
                 # blur.save_weights(args.model_path, iteration, starttime, dataset.operate)       # save blur filed
 
             # Densification
             if (iteration < opt.densify_until_iter): # and (iteration < 6000)
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                if (iteration > opt.densify_from_iter) and (iteration % opt.densification_interval == 0) and \
+                    (iteration % opt.opacity_reset_interval > -1): # 250
                     size_threshold = 10e9 if iteration > opt.opacity_reset_interval else None # set size_threshold
-                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, opt.for_min_opacity, opt.prune_cameras_extent, size_threshold, iteration) # 0.005, scene.cameras_extent
+                    if opt.prune_cameras_extent == -1:
+                        prune_cameras_extent = scene.cameras_extent # Real Cameras Extent
+                    else:
+                        prune_cameras_extent = opt.prune_cameras_extent
+                    gs_num = gaussians.densify_and_prune(opt.densify_grad_threshold, opt.min_opacity, prune_cameras_extent, size_threshold, iteration) # 0.005, scene.cameras_extent
                     gs_num['iteration'] = iteration
                     gs_texts.append(gs_num)
                     # print(iteration, gaussians.get_xyz.shape[0])
 
-                if iteration > opt.opacity_reset_interval and gaussians.get_xyz.shape[0] < 1000:
-                    gaussians.densify_from_pcd(dataset.source_path)
+                # if iteration > opt.opacity_reset_interval and gaussians.get_xyz.shape[0] < 1000: # add sfm points
+                #     gaussians.densify_from_pcd(dataset.source_path)
                     # print(iteration, gaussians.get_xyz.shape[0])
                     
                 if iteration % opt.opacity_reset_interval == 0 or (
@@ -284,22 +458,53 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 # clean views
                 # clean_views(iteration, clean_iterations, scene, gaussians, pipe, background, deform, dataset.is_6dof)
 
+                if iteration in args.depth_reinit_iter:
+                    
+                    if iteration == 2501: # reinit
+                        reinit_scale = 1.0
+                        reinit = False
+                    else: # add depth point
+                        reinit_scale = 0.1
+                        reinit = False
+                    num_depth = gaussians._xyz.shape[0] * reinit_scale
+
+                    # interesction_preserving for better point cloud reconstruction result at the early stage, not affect rendering quality
+                    # gaussians.interesction_preserving(scene, render_simp, iteration, args, pipe, background)
+                    # pts, rgb = gaussians.depth_reinit(scene, render_depth, iteration, num_depth, args, pipe, background, deform)
+                    # pts, rgb = gaussians.depth_reinit_som(scene, render_depth_som, iteration, num_depth, args, pipe, background, motion_model)
+                    pts, rgb = gaussians.depth_reinit_som_new(scene, render_depth_som, iteration, num_depth, args, pipe, background, motion_model)
+
+                    if reinit:
+                        raw_pts = gaussians.get_xyz.detach()
+                        raw_rgb = gaussians.get_features_dc.squeeze(1).detach() 
+                        gaussians.reinitial_pts(torch.cat((pts, raw_pts),dim=0), torch.cat((rgb, raw_rgb),dim=0))
+                        gaussians.training_setup(opt)
+                    else:
+                        # gaussians.add_depth_points(pts, rgb)
+                        gaussians.add_depth_points_som(pts, rgb)
+                    torch.cuda.empty_cache()
+
             # Optimizer step
             if iteration < opt.iterations: # Termination iteration
                 if iteration > opt.blur_iteration:
                     blur.optimizer.step()
                     blur.update_learning_rate(iteration)
                     blur.optimizer.zero_grad()
-                
-                gaussians.optimizer.step()
-                deform.optimizer.step()
-                
-                gaussians.update_learning_rate(iteration)
-                deform.update_learning_rate(iteration)
-                # gaussians.update_learning_rate(max(iteration - opt.position_lr_start, 0))
 
+                if som:
+                    motion_model.optimizer.step()
+                    motion_model.update_learning_rate(iteration)
+                    motion_model.optimizer.zero_grad() # deform also needs to clear gradient                    
+                else:
+                    deform.optimizer.step()
+                    deform.update_learning_rate(iteration)
+                    deform.optimizer.zero_grad() # deform also needs to clear gradient
+
+                gaussians.optimizer.step()
+                gaussians.update_learning_rate(iteration)
+                # gaussians.update_learning_rate(max(iteration - opt.position_lr_start, 0))
                 gaussians.optimizer.zero_grad(set_to_none=True) # clear gradient, every iteration clear gradient
-                deform.optimizer.zero_grad() # deform also needs to clear gradient
+                
 
     scene_name = dataset.model_path.split("/")[-1]
     print("{} : {}".format(scene_name, dataset.experiment))
@@ -340,14 +545,14 @@ def prepare_output_and_logger(args, starttime): # TensorBoard writer
     # Set up output folder
     print("Output folder: {}".format(args.model_path)) # 'output/dydeblur/D_NeRF/trex'
     os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f: # output; MARK: cfg_args
+    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f: # output;
         cfg_log_f.write(str(Namespace(**vars(args))))
 
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         # tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
-        tb_writer = SummaryWriter(os.path.join("output/dydeblur/tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
+        tb_writer = SummaryWriter(os.path.join("/mnt/data0/xuankai/DyDeblur/tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
         tb_writer.add_text('d-3dgs', args.experiment)
     else:
         print("Tensorboard not available: not logging progress")
@@ -371,8 +576,8 @@ def clean_views(iteration, clean_iterations, scene, gaussians, pipe, background,
         unvisible_pnts = ~visible_pnts
         gaussians.prune_points(unvisible_pnts)
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, blurFunc,
-                    renderArgs, deform, load2gpu_on_the_fly, is_6dof=False, dataset=None, opt=None, lpips_fn=None, model=None, use_model=True): # renderFunc == render
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, rendersomFunc, blurFunc,
+                    renderArgs, deform, motion_model, load2gpu_on_the_fly, is_6dof=False, dataset=None, opt=None, lpips_fn=None, model=None, use_model=True, use_skimage_ssim=False, som=False): # renderFunc == render
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -386,13 +591,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache() # clearing GPU memory
-        validation_configs = ({'name': 'test', 'cameras': scene.getSortedTestCameras()}, # n
-                              {'name': 'train','cameras': scene.getSortedTrainCameras()}, # n
-                              {'name': 'virtual', 'cameras': scene.getSortedVirtualCameras()}) # NOTE 4n
+        validation_configs = ({'name': 'test', 'cameras': scene.getSortedTestCameras()},) # n
+                            #   {'name': 'train','cameras': scene.getSortedTrainCameras()},) # n
+                            #   {'name': 'train','cameras': scene.getSortedTrainCameras()}, # n
+                            #   {'name': 'virtual', 'cameras': scene.getSortedVirtualCameras()}) # NOTE 4n
+
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 gts = torch.tensor([], device="cuda")
+                gt_depths = torch.tensor([], device="cuda")
                 motion_masks = torch.tensor([], device="cuda")
                 shuffle_rgbs = torch.tensor([], device="cuda")
                 images = torch.tensor([], device="cuda")
@@ -403,20 +611,23 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     torch.cuda.empty_cache() # clearing GPU memory
                     if load2gpu_on_the_fly:
                         viewpoint.load2device() # accelerate: move camera data to the GPU
-                    fid = viewpoint.fid
-                    xyz = scene.gaussians.get_xyz
-                    time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
-                    d_xyz, d_rotation, d_scaling, _ = deform.step(xyz.detach(), time_input)
+                    if not som:
+                        fid = viewpoint.fid
+                        xyz = scene.gaussians.get_xyz
+                        time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+                        d_xyz, d_rotation, d_scaling, _ = deform.step(xyz.detach(), time_input)
+
+                    gt_depth = viewpoint.depth
+                    gt_depth_show = gt_depth - gt_depth.min()
+                    gt_depth_show = gt_depth_show / gt_depth_show.max()
+                    motion_mask = viewpoint.motion_mask[None] # 1, 400, 940
 
                     if config["name"] == 'train' or config["name"] == 'virtual': # NOTE
-                        gt_depth = viewpoint.depth
-                        gt_depth = gt_depth - gt_depth.min()
-                        gt_depth = gt_depth / gt_depth.max()
-                        gt_depth = 1 - gt_depth # reverse
-                        motion_mask = viewpoint.motion_mask[None] # 1, 400, 940
-
-                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
-                        image, sharp_image, depth = ret["render"], ret["render"], ret["depth"]
+                        if som:
+                            ret = rendersomFunc(viewpoint, scene.gaussians, *renderArgs, motion_model, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        else:
+                            ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        image, sharp_image, depth, dynamic_mask = ret["render"], ret["render"], ret["depth"], ret["dynamic_mask"]
 
                         if iteration > opt.blur_iteration: # blur process
                             shuffle_rgb = sharp_image.unsqueeze(0) # 1, 3, 400, 940
@@ -425,12 +636,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             unfold_ss = torch.nn.Unfold(kernel_size=(dataset.kernel, dataset.kernel), padding=dataset.kernel // 2).cuda()
                             pos_enc = get_2d_emb(1, shuffle_rgb.shape[-2], shuffle_rgb.shape[-1], 16, torch.device(0))     
 
-                            if dataset.not_use_gt_rgbd:
+                            if dataset.not_use_dynamic_mask:
                                 kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb,shuffle_depth],1).detach()) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
                             else:
-                                gt_image = viewpoint.original_image.cuda().unsqueeze(0) # 1, 3, 400, 940
-                                gt_depth_unsqueeze = gt_depth.unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
-                                kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),gt_image,gt_depth_unsqueeze],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
+                                dmask = dynamic_mask.unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
+                                kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
 
                             patches = unfold_ss(shuffle_rgb)
                             patches = patches.view(1, 3, dataset.kernel ** 2, shuffle_rgb.shape[-2], shuffle_rgb.shape[-1])
@@ -451,15 +661,20 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             alignlosss = torch.cat((alignlosss, alignloss.unsqueeze(0)), dim=0) # alignloss; 1, 1
 
                     else:
-                        ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
-                        image, depth = ret["render"], ret["depth"]
+                        if som:
+                            ret = rendersomFunc(viewpoint, scene.gaussians, *renderArgs, motion_model, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        else:
+                            ret = renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof, train=0, lambda_s=0.01, lambda_p=0.01, max_clamp=1.1)              
+                        image, depth, dynamic_mask = ret["render"], ret["depth"], ret["dynamic_mask"]
 
                     image = torch.clamp(image, 0.0, 1.0)
-                    depth = depth - depth.min()
-                    depth = depth / depth.max()
+                    depth_show = depth - depth.min()
+                    depth_show = depth_show / depth_show.max()
 
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_depth = viewpoint.depth.unsqueeze(0).to("cuda") # 1, 400, 940
                     gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)    # gt image; 1, 3, 400, 940                    
+                    gt_depths = torch.cat((gt_depths, gt_depth.unsqueeze(0)), dim=0) # gt depth; 1, 1, 400, 940                    
                     images = torch.cat((images, image.unsqueeze(0)), dim=0) # target image; 1, 3, 400, 940
                     depths = torch.cat((depths, depth.unsqueeze(0)), dim=0) # depth; 1, 1, 400, 940
 
@@ -470,7 +685,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
                                              image[None], global_step=iteration, dataformats='NCHW')
                         tb_writer.add_images(config['name'] + "_view_{}/depth".format(viewpoint.image_name),
-                                             depth, global_step=iteration, dataformats='CHW')
+                                             depth_show, global_step=iteration, dataformats='CHW')
+                        tb_writer.add_images(config['name'] + "_view_{}/dynamic_mask".format(viewpoint.image_name),
+                                             dynamic_mask[None], global_step=iteration, dataformats='CHW')
                         if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
                             tb_writer.add_images(config['name'] + "_view_{}/sharp".format(viewpoint.image_name),
                                              sharp_image[None], global_step=iteration)
@@ -481,11 +698,11 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
                                                  gt_image[None], global_step=iteration)
-                            if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
-                                tb_writer.add_images(config['name'] + "_view_{}/gt_depth".format(viewpoint.image_name),
-                                                    gt_depth, global_step=iteration, dataformats='HW')
-                                # tb_writer.add_images(config['name'] + "_view_{}/motion_mask".format(viewpoint.image_name),
-                                #                     motion_mask, global_step=iteration, dataformats='CHW')
+                            # if config["name"] == 'train'or config["name"] == 'virtual': # NOTE
+                            tb_writer.add_images(config['name'] + "_view_{}/gt_depth".format(viewpoint.image_name),
+                                                gt_depth_show, global_step=iteration, dataformats='HW')
+                            tb_writer.add_images(config['name'] + "_view_{}/motion_mask".format(viewpoint.image_name),
+                                                motion_mask, global_step=iteration, dataformats='CHW')
                 
                 torch.cuda.empty_cache() # clearing GPU memory
                 l1_test = l1_loss(images, gts) # batch, channel, height, width -> torch.Size([])
@@ -499,7 +716,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     lpipss = []
                     for idx in tqdm(range(len(images)), desc="Metric evaluation progress"):
                         torch.cuda.empty_cache() # clearing GPU memory
-                        ssims.append(ssim(images[idx].unsqueeze(0), gts[idx].unsqueeze(0))) # 1, 3, 400, 940
+                        if use_skimage_ssim:
+                            ssims.append(structural_similarity(gts[idx].permute(1, 2, 0).cpu().numpy(), images[idx].permute(1, 2, 0).cpu().numpy(), channel_axis=-1, data_range=1)) # 3, 400, 940
+                        else:
+                            ssims.append(ssim(images[idx].unsqueeze(0), gts[idx].unsqueeze(0))) # 1, 3, 400, 940
                         if use_model:
                             with torch.no_grad():
                                 lpips_value = model.forward(images[idx].unsqueeze(0), gts[idx].unsqueeze(0))
@@ -511,7 +731,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
                 elif config['name'] == 'train':
                     train_psnr = psnr_test
-                    maskloss = opt.zmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0 
+                    maskloss = opt.blurmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0 
                     maskloss += opt.mask_sparse_loss_alpha * torch.cat((mask,1.-mask),dim=0).min(0)[0].mean() if opt.use_mask_sparse_loss else 0
                     alignloss = opt.align_loss_alpha * alignlosss.mean() if (opt.use_align_loss and iteration > opt.align_loss_iteration) else 0
                     # dynamic_tvloss = False
@@ -520,9 +740,15 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tvloss = opt.rgbtv_loss_alpha * tv_loss(shuffle_rgbs, motion_masks) if opt.use_rgbtv_loss else 0
                     else:
                         tvloss = opt.rgbtv_loss_alpha * tv_loss(shuffle_rgbs) if opt.use_rgbtv_loss else 0
-                else:
+                    # depth loss
+                    pred_disp = 1.0 / (depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_render
+                    gt_disp = 1.0 / (gt_depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_gt
+                    # depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98) * opt.depth_loss
+                    depth_loss = masked_l1_loss(pred_disp[0], gt_disp[0], quantile=0.98) * opt.depth_loss
+                  
+                else: # virtual
                     virtual_psnr = psnr_test
-                    maskloss = opt.zmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0 
+                    maskloss = opt.blurmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0 
                     maskloss += opt.mask_sparse_loss_alpha * torch.cat((mask,1.-mask),dim=0).min(0)[0].mean() if opt.use_mask_sparse_loss else 0
                     alignloss = opt.align_loss_alpha * alignlosss.mean() if (opt.use_align_loss and iteration > opt.align_loss_iteration) else 0 
                     # dynamic_tvloss = False
@@ -531,11 +757,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tvloss = opt.rgbtv_loss_alpha * tv_loss(shuffle_rgbs, motion_masks) if opt.use_rgbtv_loss else 0
                     else:
                         tvloss = opt.rgbtv_loss_alpha * tv_loss(shuffle_rgbs) if opt.use_rgbtv_loss else 0
+                    # depth loss
+                    pred_disp = 1.0 / (depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_render
+                    gt_disp = 1.0 / (gt_depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_gt
+                    # depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98) * opt.depth_virtual_loss                
+                    depth_loss = masked_l1_loss(pred_disp[0], gt_disp[0], quantile=0.98) * opt.depth_virtual_loss                
                 
                 if config['name'] == 'test':
-                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, test_ssim, test_lpips)) # MARK: console output
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} SSIM {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, test_ssim, test_lpips)) # console output
                 else:
-                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test)) # MARK: console output
+                    print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test)) # console output
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - depth_tv_loss', depth_tv_loss, iteration)
@@ -544,10 +775,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_scalar(config['name'] + '/loss_viewpoint - mask_loss', maskloss, iteration)
                         tb_writer.add_scalar(config['name'] + '/loss_viewpoint - align_loss', alignloss, iteration)
                         tb_writer.add_scalar(config['name'] + '/loss_viewpoint - rgbtv_loss', tvloss, iteration)
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - depth_loss', depth_loss, iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_histogram("scene/dynamic_histogram", scene.gaussians.get_dynamic, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache() # clearing GPU memory
 
@@ -557,9 +788,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters") # ArgumentParser: Object for parsing command line strings into Python objects.
-    lp = ModelParams(parser)            # MARK: model
-    op = OptimizationParams(parser)     # MARK: optimization
-    pp = PipelineParams(parser)         # MARK: pipeline
+    lp = ModelParams(parser)            # model
+    op = OptimizationParams(parser)     # optimization
+    pp = PipelineParams(parser)         # pipeline
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
@@ -568,6 +799,8 @@ if __name__ == "__main__":
     # parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[20000, 40000])
     parser.add_argument("--clean_iterations", nargs="+", type=int, default=list(range(10000, 25001, 5000)))
+    # parser.add_argument("--depth_reinit_iter", type=int, default=[2_501, 6_501, 12_501])
+    parser.add_argument("--depth_reinit_iter", type=int, default=[2500001]) # 2_501, 4_501, 6_501
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])          # Namespace
     args.save_iterations.append(args.iterations)    # save the last iteration
@@ -577,8 +810,6 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet) # random seed
 
-    # Start GUI server, configure and run training
-    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.clean_iterations) # lp: dataset,  op: opt,  pp: pipe,
 

@@ -15,7 +15,20 @@ import cv2
 from datetime import datetime
 import numpy as np
 import random
+from sklearn.neighbors import NearestNeighbors
+from typing import NamedTuple
 
+class TrackObservations(NamedTuple):
+    xyz: torch.Tensor
+    visibles: torch.Tensor
+    invisibles: torch.Tensor
+    confidences: torch.Tensor
+    colors: torch.Tensor
+
+class StaticObservations(NamedTuple):
+    xyz: torch.Tensor
+    normals: torch.Tensor
+    colors: torch.Tensor
 
 def inverse_sigmoid(x):
     x = torch.clamp(x, 1e-6, 1 - 1e-6)
@@ -236,3 +249,11 @@ def get_2d_emb(batch_size, x, y, out_ch, device):
     emb[:, :, : out_ch] = emb_x
     emb[:, :, out_ch : 2 * out_ch] = emb_y
     return emb[None, :, :, :].repeat(batch_size, 1, 1, 1)
+
+def knn(x: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray]:
+    x = x.cpu().numpy()
+    knn_model = NearestNeighbors(
+        n_neighbors=k + 1, algorithm="auto", metric="euclidean"
+    ).fit(x)
+    distances, indices = knn_model.kneighbors(x)
+    return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)

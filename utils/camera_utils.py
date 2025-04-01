@@ -27,7 +27,7 @@ def loadCam(args, id, cam_info, resolution_scale): # resolution_scale == 1
             orig_h / (resolution_scale * args.resolution))
     else:  # should be a type that converts to float
         if args.resolution == -1:
-            if orig_w > 1600:
+            if orig_w > 160000: # 1600
                 global WARNED
                 if not WARNED:
                     print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
@@ -55,7 +55,7 @@ def loadCam(args, id, cam_info, resolution_scale): # resolution_scale == 1
                   image=gt_image, gt_alpha_mask=loaded_mask,
                   image_name=cam_info.image_name, uid=id,
                   data_device=args.data_device if not args.load2gpu_on_the_fly else 'cpu', fid=cam_info.fid,
-                  depth=cam_info.depth, depthv2=cam_info.depthv2, blur_map=cam_info.blur_map, motion_mask=cam_info.motion_mask)
+                  depth=cam_info.depth, depth_no_sc=cam_info.depth_no_sc, depthv2=cam_info.depthv2, blur_map=cam_info.blur_map, motion_mask=cam_info.motion_mask)
 
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
@@ -111,3 +111,4 @@ def camera_nerfies_from_JSON(path, scale):
         image_size=np.array((int(round(camera_json['image_size'][0] * scale)),
                              int(round(camera_json['image_size'][1] * scale)))),
     )
+      
