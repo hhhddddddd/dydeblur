@@ -27,12 +27,19 @@ import numpy as np
 import time
 
 def render_set(model_path, not_use_dynamic_mask, load2gpu_on_the_fly, is_6dof, name, iteration, views, gaussians, pipeline, background, deform, motion_model, blur, kernel=9, train=False):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render") # name: train or test
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
+    if name == 'train': name = "deblur"
+    render_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "render") # name: train or test
+    gts_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "gt")
+    depth_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "depth")
+    conv_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "conv")
+    mask_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "mask")
+    blur_path = os.path.join(model_path, "low", name, "ours_{}".format(iteration), "blur")
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
+    makedirs(conv_path, exist_ok=True)
+    makedirs(mask_path, exist_ok=True)
+    makedirs(blur_path, exist_ok=True)
 
     # sharp_path = os.path.join(model_path, name, "ours_{}".format(iteration), "sharp")
     # makedirs(sharp_path, exist_ok=True)
@@ -78,7 +85,7 @@ def render_set(model_path, not_use_dynamic_mask, load2gpu_on_the_fly, is_6dof, n
             rgb = torch.sum(patches * kernel_weights, 2)[0] # 3, 400, 940
             mask = mask[0] # 1, 400, 940
 
-            rendering = mask*rgb + (1-mask)*rendering
+            blur_final = mask*rgb + (1-mask)*rendering
 
         depth = depth / (depth.max() + 1e-5) # normalization for visual
         gt = view.original_image[0:3, :, :]
@@ -86,6 +93,9 @@ def render_set(model_path, not_use_dynamic_mask, load2gpu_on_the_fly, is_6dof, n
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(depth, os.path.join(depth_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(rgb, os.path.join(conv_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(mask, os.path.join(mask_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(blur_final, os.path.join(blur_path, '{0:05d}'.format(idx) + ".png"))
         
 
         # torchvision.utils.save_image(sharp, os.path.join(sharp_path, '{0:05d}'.format(idx) + ".png"))
@@ -135,10 +145,10 @@ def render_sets(dataset: ModelParams, iteration: int, pipeline: PipelineParams, 
                         scene.getTrainCameras(), gaussians, pipeline,
                         background, deform, motion_model, blur, kernel=9, train=True)
 
-        if not skip_test:
-            render_func(dataset.model_path, dataset.not_use_dynamic_mask, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
-                        scene.getTestCameras(), gaussians, pipeline,
-                        background, deform, motion_model, blur, kernel=9, train=False)
+        # if not skip_test:
+        #     render_func(dataset.model_path, dataset.not_use_dynamic_mask, dataset.load2gpu_on_the_fly, dataset.is_6dof, "test", scene.loaded_iter,
+        #                 scene.getTestCameras(), gaussians, pipeline,
+        #                 background, deform, motion_model, blur, kernel=9, train=False)
 
 
 if __name__ == "__main__":

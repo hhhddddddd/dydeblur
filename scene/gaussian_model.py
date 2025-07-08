@@ -230,7 +230,7 @@ class GaussianModel: # when initial, gaussians is already belong to scene
         return fg_params, motion_bases, bg_params, tracks_3d # tracks_3d for 'run_initial_optim'
     
     def init_fg(self, cano_t, tracks_3d, motion_coefs):
-        visibiles = True
+        visibiles = True # NOTE visibiles in cano_t space
         # visibiles = False
         if visibiles:
             vis = tracks_3d.visibles[:, cano_t]

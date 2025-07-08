@@ -29,7 +29,7 @@ from utils.loss_utils import l1_loss, ssim, tv_loss, align_loss, \
     masked_l1_loss, compute_gradient_loss, compute_se3_smoothness_loss, compute_z_acc_loss
 from gaussian_renderer import render, render_depth, render_som, render_depth_som
 from scene import Scene, GaussianModel, DeformModel, MLP, Blur
-from utils.general_utils import safe_state, get_linear_noise_func, get_2d_emb
+from utils.general_utils import safe_state, get_linear_noise_func, get_2d_emb, positional_encoding
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
@@ -73,7 +73,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     camera_train_num = len(scene.getTrainCameras()) # 24
     image_h, image_w = scene.getTrainCameras()[0].original_image.shape[1:]
     print("Number Train Camera = {}, image size: {} x {}".format(camera_train_num, image_h, image_w))
-    blur = Blur(camera_train_num, image_h, image_w, ks=dataset.kernel, not_use_rgbd=False, not_use_pe=False, not_use_dynamic_mask=dataset.not_use_dynamic_mask, skip_connect=True).to("cuda") # single scale
+    blur = Blur(camera_train_num, image_h, image_w, ks=dataset.kernel, not_use_rgbd=False, not_use_pe=False, \
+                not_use_dynamic_mask=dataset.not_use_dynamic_mask, use_emb_dynamic_mask=dataset.use_emb_dynamic_mask, skip_connect=True).to("cuda")
     blur.train_setting()
     unfold_ss = torch.nn.Unfold(kernel_size=(dataset.kernel, dataset.kernel), padding=dataset.kernel // 2).cuda()
 
@@ -85,12 +86,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     if dataset.source_path.split('/')[-1] == 'dense': # DybluRF
         use_alex = False
         use_skimage_ssim = True
-    elif dataset.source_path.split('/')[-1] == 'x1': # Deblur4DGS
+    elif dataset.source_path.split('/')[-1] == 'x1': # x1
         use_alex = True
         use_skimage_ssim = True
-    else: # Deblur4DGS
+    else: # x2 or x2.5
         use_alex = True
-        use_skimage_ssim = False
+        use_skimage_ssim = True
     print("use_alex:", use_alex)
 
     # bg_color = [1, 1, 1] # Deblur4DGS
@@ -115,7 +116,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000) # Novelty: learning rate decay function
     loss_texts = []
     gs_texts = []
-    print(opt.blurmask_loss_alpha, opt.align_loss_alpha, opt.densify_grad_threshold, opt.min_opacity, opt.prune_cameras_extent)
+    print('use_sharp_downloss:', dataset.use_sharp_downloss)
     for iteration in range(1, opt.iterations + 1):
 
         iter_start.record() # record start time
@@ -146,11 +147,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         
         # opt.warm_up = 1000
         if som:
-            render_pkg_re = render_som(viewpoint_cam, gaussians, pipe, background, motion_model, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+            render_pkg_re = render_som(viewpoint_cam, gaussians, pipe, background, motion_model, train=0, lambda_s=opt.lambda_s, \
+                                       lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
 
         elif iteration < opt.warm_up:         # warm_up == 3000; maybe for static region
             d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
-            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, \
+                                   lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
 
         else:
             N = gaussians.get_xyz.shape[0]  # current gaussian quantity, eg: 10587
@@ -163,7 +166,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 tb_writer.add_histogram("scene/d_rotation", d_rotation.abs(), iteration)
                 tb_writer.add_histogram("scene/d_scaling", d_scaling.abs(), iteration)
             
-            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
+            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof, train=0, \
+                                   lambda_s=opt.lambda_s, lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
         
         image, viewspace_point_tensor, visibility_filter, radii, depth, dynamic_mask = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
             render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"], render_pkg_re["dynamic_mask"]
@@ -183,9 +187,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
 
             if dataset.not_use_dynamic_mask:
                 kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb,shuffle_depth],1).detach()) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
+            elif dataset.use_emb_dynamic_mask:
+                emb_dmask = positional_encoding(dynamic_mask.unsqueeze(-1)) # 288, 512, 1, 17
+                emb_dmask = emb_dmask.permute(2, 3, 0, 1) # 1, 17, 288, 512
+                kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),emb_dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
             else:
                 dmask = dynamic_mask.unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
-                kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
+                kernel_weights, mask = blur(viewpoint_cam.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940         
+            
             patches = unfold_ss(shuffle_rgb) # 1, 9 * 9 * 3, 400 * 940
             patches = patches.view(1, 3, dataset.kernel ** 2, shuffle_rgb.shape[-2], shuffle_rgb.shape[-1]) # 1, 3, 81, 400, 940
             kernel_weights = kernel_weights.unsqueeze(1) # 1, 1, 81, 400, 940
@@ -224,14 +233,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             pred_disp = 1.0 / (depth[..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_render
             gt_disp = 1.0 / (gt_depth[None, ..., None] + 1e-5) # 1, H, W, 1; depth -> disparity; NOTE depth_gt
             depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98)
-            loss += depth_loss * opt.depth_loss # 0.5
+            loss += depth_loss * opt.vdepth_loss # 0.5
 
             # Depth loss. (2)
             mask_dilated = max_pool(viewpoint_cam.motion_mask.float().cuda()[None, ..., None]) # refine dynamic mask / expend dynamic region 
             depth_masks = (1. - mask_dilated.float()).bool() # static region
             depth_gradient_loss = compute_gradient_loss(pred_disp, gt_disp, depth_masks, quantile=0.95)
             loss += depth_gradient_loss * opt.depth_grad_loss # 1.0
-            if iteration % 101 == 0: print('train_depth', (depth_loss*opt.depth_loss).item(), (depth_gradient_loss*opt.depth_grad_loss).item())
+            if iteration % 101 == 0: print('train_depth', (depth_loss*opt.vdepth_loss).item(), (depth_gradient_loss*opt.depth_grad_loss).item())
             
             # Mask loss.
             pred_mask = dynamic_mask[None, ..., None] # 1, H, W, 1
@@ -243,7 +252,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             if som:
                 # Motion base smooth loss. 
                 small_accel_loss = compute_se3_smoothness_loss(motion_model.params["rots"], motion_model.params["transls"])
-                loss += small_accel_loss * opt.motion_smooth_loss
+                loss += small_accel_loss * opt.xmotion_smooth_loss
 
                 # Track smooth loss.     
                 fg = gaussians.get_dynamics.detach().bool().squeeze() # 107392, 1;
@@ -259,7 +268,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 means_fg_nbs = torch.einsum("pnij,pj->pni", transfms_nbs, F.pad(fg_means, (0, 1), value=1.0))
                 means_fg_nbs = means_fg_nbs.reshape(means_fg_nbs.shape[0], 3, -1, 3) # [G, 3, n, 3]
                 small_accel_loss_tracks = 0.5 * ((2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:]).norm(dim=-1).mean())
-                loss += small_accel_loss_tracks * opt.track_smooth_loss
+                loss += small_accel_loss_tracks * opt.ytrack_smooth_loss
 
                 # z_acc loss.
                 R = np.transpose(viewpoint_cam.R) # R in w2c
@@ -268,19 +277,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 w2c = torch.tensor(np.vstack((w2c, np.array([0., 0., 0., 1.])))).unsqueeze(0).cuda()
                 z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2c) # Acceleration along ray direction should be small.
                 loss += z_accel_loss * opt.z_acc_loss
-                if iteration % 101 == 0: print('train_smooth', (small_accel_loss*opt.motion_smooth_loss).item(), \
-                        (small_accel_loss_tracks*opt.track_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
+                if iteration % 101 == 0: print('train_smooth', (small_accel_loss*opt.xmotion_smooth_loss).item(), \
+                        (small_accel_loss_tracks*opt.ytrack_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
 
             # Scale loss.
             # scale_loss = torch.var(gaussians.get_scaling, dim=-1).mean() 
             scale_loss = torch.var(gaussians._scaling, dim=-1).mean()
-            loss += scale_loss * opt.scale_var_loss
-            if iteration % 101 == 0: print('train_scale', (scale_loss*opt.scale_var_loss).item())
+            loss += scale_loss * opt.wscale_var_loss
+            if iteration % 101 == 0: print('train_scale', (scale_loss*opt.wscale_var_loss).item())
 
             # Downsample loss.
-            if iteration > (opt.blur_iteration+1000): # don't use motion mask
-                sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
-                # sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]) # 1, 1, H, W
+            if iteration > (opt.blur_iteration + 1000): # don't use motion mask
+                if dataset.use_sharp_downloss:
+                    sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
+                else:
+                    sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]).cuda() # 1, 1, H, W
+                    sharp_mask_down = F.interpolate(sharp_mask_down, scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4;
                 render_down = sharp_image.unsqueeze(0) # 1, 3, H, W; sharp image_render
                 render_down = F.interpolate(render_down, scale_factor=0.25, mode='area') # 1, 3, H, W -> 1, 3, H/4, W/4
                 render_down = render_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1) # 1, H/4, W/4, 3
@@ -306,7 +318,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             depth_masks = (1. - mask_dilated.float()).bool() # static region
             depth_gradient_loss = compute_gradient_loss(pred_disp, gt_disp, depth_masks, quantile=0.95)
             loss += depth_gradient_loss * opt.depth_grad_virtual_loss # 1.0
-            if iteration % 101 == 0: print('virtual_depth', (depth_loss*opt.depth_loss).item(), (depth_gradient_loss*opt.depth_grad_loss).item())
+            if iteration % 101 == 0: print('virtual_depth', (depth_loss*opt.depth_virtual_loss).item(), (depth_gradient_loss*opt.depth_grad_virtual_loss).item())
 
             # Mask loss.
             pred_mask = dynamic_mask[None, ..., None] # 1, H, W, 1
@@ -318,7 +330,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             if som:
                 # Motion base smooth loss. 
                 small_accel_loss = compute_se3_smoothness_loss(motion_model.params["rots"], motion_model.params["transls"])
-                loss += small_accel_loss * opt.motion_smooth_loss
+                loss += small_accel_loss * opt.xmotion_smooth_loss
 
                 # Track smooth loss.     
                 fg = gaussians.get_dynamics.detach().bool().squeeze() # 107392, 1;
@@ -334,7 +346,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 means_fg_nbs = torch.einsum("pnij,pj->pni", transfms_nbs, F.pad(fg_means, (0, 1), value=1.0))
                 means_fg_nbs = means_fg_nbs.reshape(means_fg_nbs.shape[0], 3, -1, 3) # [G, 3, n, 3]
                 small_accel_loss_tracks = 0.5 * ((2 * means_fg_nbs[:, 1:-1] - means_fg_nbs[:, :-2] - means_fg_nbs[:, 2:]).norm(dim=-1).mean())
-                loss += small_accel_loss_tracks * opt.track_smooth_loss
+                loss += small_accel_loss_tracks * opt.ytrack_smooth_loss
 
                 # z_acc loss.
                 R = np.transpose(viewpoint_cam.R) # R in w2c
@@ -343,19 +355,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 w2c = torch.tensor(np.vstack((w2c, np.array([0., 0., 0., 1.])))).unsqueeze(0).cuda()
                 z_accel_loss = compute_z_acc_loss(means_fg_nbs, w2c) # Acceleration along ray direction should be small.
                 loss += z_accel_loss * opt.z_acc_loss
-                if iteration % 101 == 0: print('virtual_smooth', (small_accel_loss*opt.motion_smooth_loss).item(), \
-                        (small_accel_loss_tracks*opt.track_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
+                if iteration % 101 == 0: print('virtual_smooth', (small_accel_loss*opt.xmotion_smooth_loss).item(), \
+                        (small_accel_loss_tracks*opt.ytrack_smooth_loss).item(), (z_accel_loss*opt.z_acc_loss).item())
             
             # Scale loss.
             # scale_loss = torch.var(gaussians.get_scaling, dim=-1).mean() 
             scale_loss = torch.var(gaussians._scaling, dim=-1).mean()
-            loss += scale_loss * opt.scale_var_loss
-            if iteration % 101 == 0: print('virtual_scale', (scale_loss*opt.scale_var_loss).item())
+            loss += scale_loss * opt.wscale_var_loss
+            if iteration % 101 == 0: print('virtual_scale', (scale_loss*opt.wscale_var_loss).item())
 
             # Downsample loss.
-            if iteration > (opt.blur_iteration+1000): # don't use motion mask
-                sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
-                # sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]) # 1, 1, H, W
+            if iteration > (opt.blur_iteration + 1000): # don't use motion mask
+                if dataset.use_sharp_downloss:
+                    sharp_mask_down = F.interpolate((1-mask.detach().unsqueeze(0)), scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4; more large more sharp
+                else:
+                    sharp_mask_down = torch.ones(1, 1, *sharp_image.shape[-2:]).cuda() # 1, 1, H, W
+                    sharp_mask_down = F.interpolate(sharp_mask_down, scale_factor=0.25, mode='area') # 1, 1, H, W -> 1, 1, H/4, W/4;
                 render_down = sharp_image.unsqueeze(0) # 1, 3, H, W; sharp image_render
                 render_down = F.interpolate(render_down, scale_factor=0.25, mode='area') # 1, 3, H, W -> 1, 3, H/4, W/4
                 render_down = render_down.permute(0, 2, 3, 1) * sharp_mask_down.permute(0, 2, 3, 1) # 1, H/4, W/4, 3
@@ -552,7 +567,8 @@ def prepare_output_and_logger(args, starttime): # TensorBoard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         # tb_writer = SummaryWriter(os.path.join(args.model_path, "tb_logs", args.operate, starttime[:16]), comment=starttime[:13], flush_secs=60)
-        tb_writer = SummaryWriter(os.path.join("/mnt/data0/xuankai/DyDeblur/tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
+        # tb_writer = SummaryWriter(os.path.join("/mnt/data0/xuankai/DyDeblur/tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
+        tb_writer = SummaryWriter(os.path.join("/mnt/data0/xuankai/DyDeblur/new_tb_log", args.model_path.split('/')[-1], starttime[5:16]+'_'+args.experiment), comment=starttime[:13], flush_secs=60)
         tb_writer.add_text('d-3dgs', args.experiment)
     else:
         print("Tensorboard not available: not logging progress")
@@ -638,6 +654,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
                             if dataset.not_use_dynamic_mask:
                                 kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb,shuffle_depth],1).detach()) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
+                            elif dataset.use_emb_dynamic_mask:
+                                emb_dmask = positional_encoding(dynamic_mask.unsqueeze(-1)) # 288, 512, 1, 17
+                                emb_dmask = emb_dmask.permute(2, 3, 0, 1) # 1, 17, 288, 512
+                                kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),emb_dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
                             else:
                                 dmask = dynamic_mask.unsqueeze(0).unsqueeze(0) # 1, 1, 400, 940
                                 kernel_weights, mask = blurFunc(viewpoint.uid, pos_enc, torch.cat([shuffle_rgb.detach(),shuffle_depth.detach(),dmask.detach()],1)) # kernel_weights: 1, 81, 400, 940; mask: 1, 1, 400, 940
@@ -743,8 +763,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     # depth loss
                     pred_disp = 1.0 / (depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_render
                     gt_disp = 1.0 / (gt_depths.permute(0, 2, 3, 1) + 1e-5) # B, H, W, 1; depth -> disparity; NOTE depth_gt
-                    # depth_loss = masked_l1_loss(pred_disp, gt_disp, quantile=0.98) * opt.depth_loss
-                    depth_loss = masked_l1_loss(pred_disp[0], gt_disp[0], quantile=0.98) * opt.depth_loss
+                    depth_loss = masked_l1_loss(pred_disp[0], gt_disp[0], quantile=0.98) * opt.vdepth_loss
                   
                 else: # virtual
                     virtual_psnr = psnr_test

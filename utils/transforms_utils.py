@@ -137,7 +137,7 @@ def get_weights_for_procrustes(clusters, visibilities=None): # clusters: [num_fr
     weights /= weights.mean(dim=-1, keepdim=True) + 1e-6 # normalize
     if visibilities is not None:
         weights *= visibilities.float() + 1e-6
-    invalid = dists2clusters_center > np.quantile(
+    invalid = dists2clusters_center > np.quantile( # remove outliers
         dists2clusters_center.cpu().numpy(), 0.9
     )
     invalid |= torch.isnan(weights)

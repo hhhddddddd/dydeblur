@@ -59,13 +59,15 @@ class ModelParams(ParamGroup): # ModelParams inherits ParamGroup
         self._time = ""
         self._images = "images"
         self._resolution = -1
-        self._white_background = False
+        self.white_background = False # NOTE _w
         self.data_device = "cuda"
         self.eval = False
         self.load2gpu_on_the_fly = False
         self.is_blender = False
         self.is_6dof = False
         self.not_use_dynamic_mask = False
+        self.use_emb_dynamic_mask = False
+        self.use_sharp_downloss = False
         self.canot = 12 # useless
         self.gaussian_spatial_lr_scale = 5.0
         self.deform_spatial_lr_scale = 5.0
@@ -134,16 +136,16 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
         
 
         # all loss.
-        self.depth_loss = 0.0 # 0.075
+        self._vdepth_loss = 0.075 # 0.075
         self.depth_grad_loss = 0.0 # 1.0; static region        
         self.depth_virtual_loss = 0.0 # 0.5
         self.depth_grad_virtual_loss = 0.0 # 1.0; static region
-        self.scale_var_loss = 0.00 # 0.01
+        self._wscale_var_loss = 0.0 # 0.01
         
-        self.mask_loss = 0.075 # 1.0
-        self.motion_smooth_loss = 0.075 # 0.1
-        self.track_smooth_loss = 0.2 # 2.0
-        self.z_acc_loss = 1.0
+        self.mask_loss = 0.075 # 0.075
+        self._xmotion_smooth_loss = 0.0 # 0.075
+        self._ytrack_smooth_loss = 0.0 # 0.2
+        self._z_acc_loss = 0.0 # 1.0
         self.downsample_loss = 0.1 # 0.1
 
         # no loss.

@@ -237,18 +237,18 @@ def get_emb(sin_inp):
 
 
 def get_2d_emb(batch_size, x, y, out_ch, device):
-    out_ch = int(np.ceil(out_ch / 4) * 2)
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, out_ch, 2).float() / out_ch))
-    pos_x = torch.arange(x, device=device).type(inv_freq.type())*2*np.pi/x
-    pos_y = torch.arange(y, device=device).type(inv_freq.type())*2*np.pi/y
-    sin_inp_x = torch.einsum("i,j->ij", pos_x, inv_freq)
-    sin_inp_y = torch.einsum("i,j->ij", pos_y, inv_freq)
-    emb_x = get_emb(sin_inp_x).unsqueeze(1)
-    emb_y = get_emb(sin_inp_y)
-    emb = torch.zeros((x, y, out_ch * 2), device=device)
+    out_ch = int(np.ceil(out_ch / 4) * 2) # 8
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, out_ch, 2).float() / out_ch)) # (4,)
+    pos_x = torch.arange(x, device=device).type(inv_freq.type())*2*np.pi/x # (288,)
+    pos_y = torch.arange(y, device=device).type(inv_freq.type())*2*np.pi/y # (512,)
+    sin_inp_x = torch.einsum("i,j->ij", pos_x, inv_freq) # (288, 4)
+    sin_inp_y = torch.einsum("i,j->ij", pos_y, inv_freq) # (512, 4)
+    emb_x = get_emb(sin_inp_x).unsqueeze(1) # 288, 1, 8
+    emb_y = get_emb(sin_inp_y) # 512, 8
+    emb = torch.zeros((x, y, out_ch * 2), device=device) # 288, 512, 16
     emb[:, :, : out_ch] = emb_x
     emb[:, :, out_ch : 2 * out_ch] = emb_y
-    return emb[None, :, :, :].repeat(batch_size, 1, 1, 1)
+    return emb[None, :, :, :].repeat(batch_size, 1, 1, 1) # 1, 288, 512, 16
 
 def knn(x: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray]:
     x = x.cpu().numpy()
@@ -257,3 +257,15 @@ def knn(x: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray]:
     ).fit(x)
     distances, indices = knn_model.kneighbors(x)
     return distances[:, 1:].astype(np.float32), indices[:, 1:].astype(np.float32)
+
+def positional_encoding(mask, num_frequencies=8):
+    mask = torch.tensor(mask, dtype=torch.float32)  # (512, 512, 1)
+    freqs = torch.linspace(1.0, 10.0, num_frequencies)  
+    encodings = [mask]  # remain mask
+    for f in freqs:
+        encodings.append(torch.sin(mask * f * torch.pi))  # sin 
+        encodings.append(torch.cos(mask * f * torch.pi))  # cos 
+    return torch.stack(encodings, dim=-1)  # (512, 512, 16)
+
+# mask = torch.rand(512, 512, 1)  # 生成随机 mask
+# encoded_mask = positional_encoding(mask)  # 输出形状 (512, 512, 16)

@@ -168,10 +168,10 @@ def init_motion_params_with_procrustes(
         id_rot = torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=device)
         rot_dim = 6
 
-    init_rots = id_rot.reshape(1, 1, rot_dim).repeat(num_bases, num_frames, 1)
-    init_ts = torch.zeros(num_bases, num_frames, 3, device=device)
-    errs_before = np.full((num_bases, num_frames), -1.0)
-    errs_after = np.full((num_bases, num_frames), -1.0)
+    init_rots = id_rot.reshape(1, 1, rot_dim).repeat(num_bases, num_frames, 1) # 20, 24, 6
+    init_ts = torch.zeros(num_bases, num_frames, 3, device=device) # 20, 24, 3
+    errs_before = np.full((num_bases, num_frames), -1.0) # 20, 24
+    errs_after = np.full((num_bases, num_frames), -1.0) # 20, 24
 
     tgt_ts = list(range(cano_t - 1, -1, -1)) + list(range(cano_t, num_frames)) # [9, ..., 0, 10, ..., 23]; cano_t: 10
     skipped_ts = {}
@@ -227,7 +227,7 @@ def init_motion_params_with_procrustes(
                 errs_after[n, cur_t] = err
                 errs_before[n, cur_t] = err_before
             prev_t = cur_t
-        skipped_ts[cluster_id.item()] = cluster_skip_ts
+        skipped_ts[cluster_id.item()] = cluster_skip_ts # useless
 
     bases = MotionBases(init_rots, init_ts)
     return bases, motion_coefs, tracks_3d
