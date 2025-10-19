@@ -1,9 +1,11 @@
 #!/bin/bash
 
-d2rf="Camp Car Dining1 Dining2 Dock Gate Mountain Shop"
-dyblurf="man seesaw skating street third women"
-# dyblurf="man"
+# d2rf="Camp Car Dining1 Dining2 Dock Gate Mountain Shop"
+# dyblurf="man seesaw skating street third women"
+d2rf="Camp"
+dyblurf="women"
 skating="skating"
+K="3 5 7 9 11 13 15"
 declare -A sc
 sc["Camp"]="0.1"
 sc["Car"]="0.01"
@@ -38,12 +40,18 @@ time["street"]="2025-02-17_00:23"
 time["third"]="2025-02-17_00:23"
 time["women"]="2025-02-17_00:23"
 
-###------------------------------ train low ------------------------------###
-export CUDA_VISIBLE_DEVICES=6
-for scene in $dyblurf; do
-    python train.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene \
-                    -o new -c ${sc["$scene"]} -e l_sc${sc["$scene"]}_noaddpoint_noscaleloss -w 0.0 --eval --iterations 40000
+export CUDA_VISIBLE_DEVICES=7
+for k in $K; do
+    python train.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/women/x2.5 -m output/dydeblur/Dydeblur/dyblurf/women \
+                    -o new -c 0.01 -e l_k_$k -w 0.0 -k $k --eval --iterations 40000
 done
+
+###------------------------------ train low ------------------------------###
+# export CUDA_VISIBLE_DEVICES=6
+# for scene in $dyblurf; do
+#     python train.py -s /home/xuankai/dataset/xuankai/new_deblur4dgs/$scene/x2.5 -m output/dydeblur/Dydeblur/dyblurf/$scene \
+#                     -o new -c ${sc["$scene"]} -e l_sc${sc["$scene"]}_noaddpoint_noscaleloss -w 0.0 --eval --iterations 40000
+# done
 
 # export CUDA_VISIBLE_DEVICES=1
 # for scene in $d2rf; do

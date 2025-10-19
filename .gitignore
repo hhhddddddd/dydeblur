@@ -10,7 +10,7 @@ screenshots
 data
 assets
 pretrained
-*.md
+# *.md
 scripts.sh
 scriptss.sh
 scriptsss.sh

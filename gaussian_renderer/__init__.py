@@ -10,6 +10,7 @@
 #
 
 import roma
+import time
 import torch
 import torch.nn.functional as F
 import math
@@ -307,6 +308,7 @@ def render_som(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     indices = torch.nonzero(fg).squeeze() # fg index
     # print("Foreground Gaussians:", len(indices)) # 7392
 
+    deformation_t_start = time.time()
     means = pc.get_xyz          # 107392, 3
     quats = pc.get_rotation     # 107392, 4
     coefs = pc.get_motion_coefs # 107392, 10
@@ -335,6 +337,8 @@ def render_som(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     quats_clone = quats.clone() # 107392, 4
     means_clone[indices] = fg_means.squeeze(1) # update fg means
     quats_clone[indices] = fg_quats.squeeze(1) # update fg quats
+    deformation_t_end = time.time()
+    deformation_t = (deformation_t_end - deformation_t_start)
 
     means3D = means_clone
     # means3D = means
@@ -374,6 +378,7 @@ def render_som(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
     # dynamic_means2D.retain_grad() # retain gradient
 
     if not train:  # testing time
+        rasterizer_t_start = time.time()
         rendered_image, radii, depth = rasterizer(
             means3D = means3D,
             means2D = means2D,
@@ -393,6 +398,8 @@ def render_som(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
             scales=scales,
             rotations=rotations,
             cov3D_precomp=cov3D_precomp)
+        rasterizer_t_end = time.time()
+        rasterizer_t = (rasterizer_t_end - rasterizer_t_start)
         
         return {"render": rendered_image,
         "viewspace_points": screenspace_points,
@@ -400,7 +407,9 @@ def render_som(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor
         "radii": radii,
         "depth": depth,
         "sharp_image": rendered_image,
-        "dynamic_mask": dynamic_mask[0, ...],}
+        "dynamic_mask": dynamic_mask[0, ...],
+        "deformation_time": deformation_t,
+        "rasterizer_time": rasterizer_t,}
         # "dynamic_mask": depth,}
 
     else: # training time

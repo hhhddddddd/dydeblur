@@ -154,7 +154,7 @@ class Scene:
         elif os.path.exists(os.path.join(args.source_path, "flow3d_preprocessed")):
             print("DyDeblur, assuming DyDeblur data set!")
             fg_params, motion_bases, bg_params, tracks_3d = self.gaussians.depth_track_point(scene_info.foreground_points, scene_info.background_points, args.canot)
-            self.run_initial_optim(fg_params, motion_bases, tracks_3d, scene_info.Ks, scene_info.w2cs, num_iters=1000) # tracks_3d is gt; 1000
+            # self.run_initial_optim(fg_params, motion_bases, tracks_3d, scene_info.Ks, scene_info.w2cs, num_iters=1000) # tracks_3d is gt; 1000
             self.motion_model = motion_bases # deform model
             # TODO add depth foregroud
             # init gaussian
@@ -325,7 +325,8 @@ class Scene:
     def generateVirtualCams(self, input_cams, target_cams, sc, batch_size=4, inpaint=True):
         print('Train view num: ', len(input_cams))
 
-        input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, target_extrs, target_intrs = self.prepare_data(input_cams, target_cams, sc) # mvs_depths: absolute depth
+        input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, target_extrs, \
+        target_intrs = self.prepare_data(input_cams, target_cams, sc) # mvs_depths: absolute depth
 
         # split into batches
         input_batches = create_batches(input_imgs, input_blur_maps, input_motion_masks, mvs_depths, input_extrs, input_intrs, batch_size=batch_size)

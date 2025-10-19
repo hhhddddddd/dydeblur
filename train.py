@@ -73,6 +73,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
     camera_train_num = len(scene.getTrainCameras()) # 24
     image_h, image_w = scene.getTrainCameras()[0].original_image.shape[1:]
     print("Number Train Camera = {}, image size: {} x {}".format(camera_train_num, image_h, image_w))
+    print("K = ", dataset.kernel)
     blur = Blur(camera_train_num, image_h, image_w, ks=dataset.kernel, not_use_rgbd=False, not_use_pe=False, \
                 not_use_dynamic_mask=dataset.not_use_dynamic_mask, use_emb_dynamic_mask=dataset.use_emb_dynamic_mask, skip_connect=True).to("cuda")
     blur.train_setting()
@@ -146,6 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         fid = viewpoint_cam.fid # input time
         
         # opt.warm_up = 1000
+        iteration_t1_start = time.time()
         if som:
             render_pkg_re = render_som(viewpoint_cam, gaussians, pipe, background, motion_model, train=0, lambda_s=opt.lambda_s, \
                                        lambda_p=opt.lambda_p, max_clamp=opt.max_clamp)              
@@ -171,6 +173,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         
         image, viewspace_point_tensor, visibility_filter, radii, depth, dynamic_mask = render_pkg_re["render"], render_pkg_re["viewspace_points"], \
             render_pkg_re["visibility_filter"], render_pkg_re["radii"], render_pkg_re["depth"], render_pkg_re["dynamic_mask"]
+        deformation_time = render_pkg_re["deformation_time"]
+        rasterizer_time = render_pkg_re["rasterizer_time"]
 
         maskloss = 0.
         maskloss_sparse = 0.
@@ -179,6 +183,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
         alignloss = 0.
         if iteration > opt.blur_iteration: # in order to stable train
             
+            blur_t_start = time.time()
             sharp_image = image
             shuffle_rgb = image.unsqueeze(0) # 1, 3, 400, 940
             shuffle_depth = depth.unsqueeze(0) - depth.min() # 1, 1, 400, 940
@@ -203,6 +208,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
             # mask = torch.max(mask, dynamic_mask.unsqueeze(0)*1.0) # motion_mask update mask
             image = mask*rgb + (1-mask)*image
             # image = rgb
+            blur_t_end = time.time()
+            blur_t = (blur_t_end - blur_t_start)
+
 
             maskloss = opt.blurmask_loss_alpha * abs((mask.mean() - 0)) if (opt.use_mask_loss and (iteration > 0)) else 0
             maskloss_sparse = opt.mask_sparse_loss_alpha * torch.cat((mask,1.-mask),dim=0).min(0)[0].mean() if opt.use_mask_sparse_loss else 0
@@ -382,6 +390,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 
         loss.backward() # retain_graph=True
         iter_end.record() # record end time
+        iteration_t1_end = time.time()
+        iteration_t1 = iteration_t1_end - iteration_t1_start
 
         if dataset.load2gpu_on_the_fly:
             viewpoint_cam.load2device('cpu')    # restore: move camera data to the CPU
@@ -500,6 +510,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                     torch.cuda.empty_cache()
 
             # Optimizer step
+            iteration_t2_start = time.time()
             if iteration < opt.iterations: # Termination iteration
                 if iteration > opt.blur_iteration:
                     blur.optimizer.step()
@@ -519,7 +530,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, clean_it
                 gaussians.update_learning_rate(iteration)
                 # gaussians.update_learning_rate(max(iteration - opt.position_lr_start, 0))
                 gaussians.optimizer.zero_grad(set_to_none=True) # clear gradient, every iteration clear gradient
-                
+
+            if iteration > opt.blur_iteration and False:
+                iteration_t2_end = time.time()
+                iteration_t2 = iteration_t2_end - iteration_t2_start
+                deformation_t_normal = deformation_time / (iteration_t1 + iteration_t2)
+                rasterizer_t_normal = rasterizer_time / (iteration_t1 + iteration_t2)
+                blur_t_normal = blur_t / (iteration_t1 + iteration_t2)
+                print("deform: {:.5f},  rasterizer: {:.5f}, blur: {:.5f},".format(deformation_t_normal, rasterizer_t_normal, blur_t_normal), end=' ')
+
 
     scene_name = dataset.model_path.split("/")[-1]
     print("{} : {}".format(scene_name, dataset.experiment))
