@@ -1,4 +1,4 @@
-# Dynamic Gaussian Splatting from Defocused and Motion-blurred Monocular Videos (NIPS 2025)
+# Dynamic Gaussian Splatting from Defocused and Motion-blurred Monocular Videos (NeurIPS 2025)
 
 Xuankai Zhang, Junjin Xiao, and Qing Zhang
 
