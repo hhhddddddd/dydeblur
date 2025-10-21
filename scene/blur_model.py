@@ -104,9 +104,9 @@ class Blur(nn.Module):
             rgbd_feat = self.conv_rgbd(img) # 1, 32, 400, 940
             feat = self.mlp_base_mlp(torch.cat([inp,rgbd_feat],1)) # 1, 64, 400, 940
 
-        flops_scene_feature, params = profile(self.conv_rgbd, inputs=(img,))
+        # flops_scene_feature, params = profile(self.conv_rgbd, inputs=(img,))
         # print(f"Flops scene: {flops_scene_feature}, Params: {params}") # NOTE
-        flops_mlp_base, params = profile(self.mlp_base_mlp, inputs=(torch.cat([inp,rgbd_feat],1),))
+        # flops_mlp_base, params = profile(self.mlp_base_mlp, inputs=(torch.cat([inp,rgbd_feat],1),))
         # print(f"Flops mlp base: {flops_mlp_base}, Params: {params}") # NOTE
 
 
@@ -118,12 +118,12 @@ class Blur(nn.Module):
             mask = self.mlp_mask1(feat) # 1, 1, 400, 940
             weight = self.mlp_head1(feat) # 1, 9 * 9, 400, 940 # NOTE
 
-        flops_mask_head, params = profile(self.mlp_mask1, inputs=(torch.cat([feat,img],1),))
+        # flops_mask_head, params = profile(self.mlp_mask1, inputs=(torch.cat([feat,img],1),))
         # print(f"Flops mask head: {flops_mask_head}, Params: {params}") # NOTE
-        flops_weight_head, params = profile(self.mlp_head1, inputs=(torch.cat([feat,img],1),))
+        # flops_weight_head, params = profile(self.mlp_head1, inputs=(torch.cat([feat,img],1),))
         # print(f"Flops weight head: {flops_weight_head}, Params: {params}") # NOTE
-        flops = flops_scene_feature + flops_mlp_base + flops_mask_head + flops_weight_head
-        print(f"FLOPs: {flops / 1e9:.2f} G")
+        # flops = flops_scene_feature + flops_mlp_base + flops_mask_head + flops_weight_head
+        # print(f"FLOPs: {flops / 1e9:.2f} G")
 
         weight = torch.softmax(weight, dim=1)
         mask = torch.sigmoid(mask)

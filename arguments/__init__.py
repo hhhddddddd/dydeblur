@@ -91,7 +91,7 @@ class OptimizationParams(ParamGroup): # OptimizationParams inherits ParamGroup
     def __init__(self, parser):
         self.iterations = 40_000
         self.warm_up = 3_000 # 3000
-        self.blur_iteration = 100 # 3500
+        self.blur_iteration = 3_500 # 3500
         self.virtual_interval = 5 # 5
         self.position_lr_init = 0.00016 # 0.00016
         self.position_lr_final = 0.0000016 # 0.0000016
