@@ -4,6 +4,8 @@ Xuankai Zhang, Junjin Xiao, and Qing Zhang
 
 [Project Page](https://dydeblur.github.io/) &nbsp; [Paper](https://arxiv.org/abs/2510.10691) 
 
+<a href="https://info.flagcounter.com/dhPB"><img src="https://s01.flagcounter.com/mini/dhPB/bg_FFFFFF/txt_000000/border_FFFFFF/flags_0/" alt="Flag Counter" border="0"></a>
+
 <!-- **05.28**: Our paper is updated with new features (ex. camera motion blur deblurring, more experiments, ...) so please check the new paper at https://arxiv.org/abs/2401.00834.  -->
 
 ![curve](asset/teaser.png)
@@ -45,6 +47,7 @@ python train.py -s <dataset> -m <output> -o <expname> -c 0.01 --eval --iteration
 ```
 python render.py -m <output> -o <expname> -c 0.01 -t <time> --mode render 
 ```
+<!-- ![](https://komarev.com/ghpvc/?username=hhhddddddd&color=green) -->
 
 ## BibTeX
 ```
