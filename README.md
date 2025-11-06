@@ -8,13 +8,13 @@ Xuankai Zhang, Junjin Xiao, and Qing Zhang
 
 <!-- **05.28**: Our paper is updated with new features (ex. camera motion blur deblurring, more experiments, ...) so please check the new paper at https://arxiv.org/abs/2401.00834.  -->
 
-![curve](asset/teaser.png)
+![curve](asset/dydeblurteaser.svg)
 
 Our method allows to synthesize high-quality sharp novel views for videos with defocus blur (top) and motion blur (bottom).
 
 
 ## Method Overview
-![workflow](asset/overview.png)
+![workflow](asset/dydeblur.svg)
 
 <!-- Our method's overall workflow. Dotted arrows and dashed arrows describe the pipeline for modeling camera motion blur and modeling defocus blur, respectively at training time. Solid arrows show the process of rendering sharp images at the inference time. Please refer to the paper for more details. -->
 
